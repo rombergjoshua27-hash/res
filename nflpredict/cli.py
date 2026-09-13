@@ -5,6 +5,7 @@
     nflpredict backtest                # prove the accuracy claim
     nflpredict ratings                 # current Elo power ratings
     nflpredict evaluate --season 2025  # score a finished season
+    nflpredict export                  # everything, as an Excel workbook
     nflpredict update                  # refresh cached data
 """
 
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 from typing import Tuple
 
 import pandas as pd
@@ -180,6 +182,65 @@ def cmd_evaluate(args) -> int:
     return 0
 
 
+def cmd_export(args) -> int:
+    """Write every model output to a multi-sheet Excel workbook."""
+    from datetime import datetime
+
+    from .excel import export_workbook
+
+    _, features = _build(args)
+
+    season, week = _target_slate(features, args)
+    predictor = _fit_through(features, season, week, args)
+    slate = features[(features["season"] == season) & (features["week"] == week)].copy()
+    predictions = predictor.predict(slate)
+    merged = slate.merge(
+        predictions.drop(columns=["game_id"]).assign(
+            game_id=predictions["game_id"].values
+        ),
+        on="game_id",
+        how="left",
+    )
+    slate_out = attach_edges(merged).sort_values("pick_prob", ascending=False)
+
+    engine = EloEngine(use_qb=args.qb_adjustment)
+    engine.run(load_games(quiet=args.quiet))
+    ratings = engine.current_ratings()
+
+    if not args.quiet:
+        print(f"Backtesting {args.start}-{args.end or 'latest'} for the workbook ...")
+    result = walk_forward(
+        features,
+        start_season=args.start,
+        end_season=args.end,
+        use_market=not args.no_market,
+        market_blend=args.market_blend,
+        refit=args.refit,
+        quiet=args.quiet,
+    )
+
+    meta = {
+        "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "start": args.start,
+        "end": args.end or int(result.predictions["season"].max()),
+        "slate_season": season,
+        "slate_week": week,
+        "slate_train": predictor.report.n_train,
+        "market_blend": args.market_blend,
+    }
+
+    path = Path(args.output) if args.output else (
+        config.OUTPUT_DIR / f"nflpredict_{season}_wk{week:02d}.xlsx"
+    )
+    export_workbook(path, slate=slate_out, ratings=ratings, result=result, meta=meta)
+    print(f"Workbook written to {path}")
+    print(
+        f"  8 sheets | {len(slate_out)} slate games | {len(ratings)} teams | "
+        f"{len(result.predictions):,} backtested games"
+    )
+    return 0
+
+
 def cmd_update(args) -> int:
     games = load_games(refresh=True, quiet=False)
     seasons = range(args.epa_start, int(games["season"].max()) + 1)
@@ -266,6 +327,17 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--season", type=int, default=None)
     evaluate.add_argument("--refit", choices=("week", "season"), default="week")
     evaluate.set_defaults(func=cmd_evaluate)
+
+    export = subparsers.add_parser(
+        "export", parents=[common], help="write all outputs to an Excel workbook"
+    )
+    export.add_argument("--season", type=int, help="slate season (default: current)")
+    export.add_argument("--week", type=int, help="slate week (default: next unplayed)")
+    export.add_argument("--start", type=int, default=config.DEFAULT_BACKTEST_START)
+    export.add_argument("--end", type=int, default=None)
+    export.add_argument("--refit", choices=("week", "season"), default="season")
+    export.add_argument("-o", "--output", help="output path (default: out/*.xlsx)")
+    export.set_defaults(func=cmd_export)
 
     update = subparsers.add_parser(
         "update", parents=[common], help="refresh cached data"
