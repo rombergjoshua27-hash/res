@@ -255,6 +255,60 @@ CONFIDENCE_TIERS = (
 )
 
 # --------------------------------------------------------------------------
+# What a stated confidence has actually been worth
+# --------------------------------------------------------------------------
+#
+# A confidence rating nobody has checked is decoration. These are the
+# realised rates behind each one, measured walk-forward over 2008-2026
+# (4,912 games) and reproducible with `nflpredict backtest`. They are what
+# the Betting Picks tab quotes next to the model's own number, because the
+# gap between the two is the only thing that makes a confidence useful.
+
+# Straight-up picks: (lower bound of stated confidence, games, realised rate).
+# The model is well calibrated here -- a stated 70% really does win about 70%.
+CALIBRATION_BANDS = (
+    (0.90, 32, 0.969),
+    (0.80, 475, 0.866),
+    (0.75, 522, 0.757),
+    (0.70, 703, 0.771),
+    (0.65, 738, 0.670),
+    (0.60, 877, 0.605),
+    (0.55, 866, 0.571),
+    (0.50, 699, 0.534),
+)
+
+# Against the spread, by how far the model's number sits from the posted one:
+# (minimum edge in points, bets, realised win rate).
+#
+# Every row with a usable sample is below the 52.38% needed to break even at
+# -110. The 3.0 row is 60.9% on twenty-three bets, which is not an edge, it is
+# a sample of twenty-three -- and is exactly the row a betting system would
+# advertise. It is kept so the small sample is visible rather than omitted.
+ATS_BY_EDGE = (
+    (3.0, 23, 0.609),
+    (2.0, 317, 0.478),
+    (1.5, 888, 0.508),
+    (1.0, 2036, 0.494),
+    (0.5, 3488, 0.493),
+    (0.0, 4912, 0.496),
+)
+
+# Over/under, same shape. The 3-4 point rows creep just past breakeven, but
+# on 940-1,612 bets the standard error is about 1.5 points of win rate, so
+# they are indistinguishable from it.
+OU_BY_EDGE = (
+    (5.0, 532, 0.509),
+    (4.0, 940, 0.526),
+    (3.0, 1612, 0.525),
+    (2.0, 2477, 0.518),
+    (1.0, 3651, 0.513),
+    (0.0, 4912, 0.508),
+)
+
+# Win rate needed to break even at standard -110 pricing.
+BREAKEVEN_AT_STANDARD_VIG = 0.5238
+
+# --------------------------------------------------------------------------
 # Franchise continuity
 # --------------------------------------------------------------------------
 

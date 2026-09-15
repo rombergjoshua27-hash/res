@@ -1632,7 +1632,7 @@ def _add_back_link(sheet) -> None:
 
 SIMPLE_SHEETS = (
     "Predictions", "Spread", "Point Totals", "Player Projections",
-    "Matchup Picker", "Power Ratings", "Last Week",
+    "Matchup Picker", "Betting Picks", "Power Ratings", "Last Week",
 )
 
 
@@ -1678,7 +1678,7 @@ def _build_simple_predictions(sheet, rec: Recorder, slate, meta, scorecard) -> N
             sheet, r, 5,
             f'=IF($D{r}>=0.75,"HIGH",IF($D{r}>=0.65,"MEDIUM",'
             f'IF($D{r}>=0.575,"LEAN","COIN FLIP")))',
-            _tier(confidence),
+            _simple_tier(confidence),
         )
         rec.formula(
             sheet, r, 6, f"=-100*$D{r}/(1-$D{r})",
@@ -1938,6 +1938,139 @@ def _graded(value, *, half: str = "") -> str:
     return half or "PUSH"
 
 
+def _simple_tier(confidence: float) -> str:
+    """Confidence label for the short workbook.
+
+    Spelled with a space, unlike ``_tier``, because these tabs are meant to
+    be read rather than parsed. It exists so the Python-cached value and the
+    Excel formula agree: they disagreed once, and the cell silently changed
+    the first time anything recalculated it.
+    """
+    for threshold, label in config.CONFIDENCE_TIERS:
+        if confidence >= threshold:
+            return "COIN FLIP" if label == "COINFLIP" else label
+    return "COIN FLIP"
+
+
+def _band_rate(confidence: float) -> tuple:
+    """The calibration band covering ``confidence``: (sample size, realised rate)."""
+    for lower, games, rate in config.CALIBRATION_BANDS:
+        if confidence >= lower:
+            return games, rate
+    return config.CALIBRATION_BANDS[-1][1], config.CALIBRATION_BANDS[-1][2]
+
+
+def _ev(probability: float, odds: float | None) -> float | None:
+    """Profit per unit staked at ``odds`` given ``probability``."""
+    if odds is None:
+        return None
+    payout = odds / 100.0 if odds > 0 else 100.0 / abs(odds)
+    return probability * payout - (1.0 - probability)
+
+
+def _build_simple_picks(sheet, rec: Recorder, slate, meta, scorecard) -> None:
+    """Every pick this week, ranked by how much confidence it has earned.
+
+    Two deliberate choices about what "confidence" means here.
+
+    *Straight-up picks carry the model's own probability*, because that is
+    the one number in this project that has been checked and holds up: a
+    stated 70% really has won about 70% across 4,912 games. The expected
+    value beside it uses that probability against the posted price.
+
+    *Spread and total picks are rated a coin flip*, because that is what
+    nineteen seasons say they are -- 49.6% and 50.8%, against the 52.38%
+    needed to break even. It is tempting to rate them by how far the model
+    sits from the line, and the per-bucket rates are in ``config`` for
+    anyone who wants them, but the buckets do not survive their own sample
+    sizes: the best-looking one is 60.9% on twenty-three bets. Rating a pick
+    by a bucket like that would be inventing confidence, which is the one
+    thing a tab called Betting Picks must not do.
+    """
+    row = _simple_title(sheet, "Betting Picks", meta, scorecard)
+
+    ats_rate = config.ATS_BY_EDGE[-1][2]
+    ou_rate = config.OU_BY_EDGE[-1][2]
+    vig_ev = _ev(ats_rate, config.STANDARD_VIG_ODDS)
+    ou_ev = _ev(ou_rate, config.STANDARD_VIG_ODDS)
+
+    entries = []
+    for game in slate.itertuples(index=False):
+        matchup = f"{game.away_team} @ {game.home_team}"
+
+        prob = float(game.prob_home)
+        confidence = max(prob, 1.0 - prob)
+        picked = game.home_team if prob >= 0.5 else game.away_team
+        games, realised = _band_rate(confidence)
+        odds = _num(getattr(game, "pick_odds", None))
+        entries.append((
+            confidence, "Moneyline", matchup, picked, confidence,
+            f"{realised:.0%} over {games:,} games", _ev(confidence, odds),
+        ))
+
+        line = _num(getattr(game, "market_spread", None))
+        model = _num(getattr(game, "pred_margin", None))
+        if line is not None and model is not None:
+            side = game.home_team if model > line else game.away_team
+            number = line if side == game.home_team else -line
+            entries.append((
+                ats_rate, "Spread", matchup, f"{side} {number:+.1f}", ats_rate,
+                f"{ats_rate:.1%} over 4,912 games", vig_ev,
+            ))
+
+        total_line = _num(getattr(game, "market_total", None))
+        projection = _num(getattr(game, "pred_total", None))
+        if total_line is not None and projection is not None:
+            side = "Over" if projection > total_line else "Under"
+            entries.append((
+                ou_rate, "Total", matchup, f"{side} {total_line:.1f}", ou_rate,
+                f"{ou_rate:.1%} over 4,912 games", ou_ev,
+            ))
+
+    entries.sort(key=lambda entry: entry[0], reverse=True)
+
+    _write_header(
+        sheet, row,
+        ["Market", "Game", "Pick", "Confidence", "Rating",
+         "What that has been worth", "EV per $1"],
+    )
+
+    first = row + 1
+    for offset, entry in enumerate(entries):
+        _, market, matchup, pick, confidence, realised, ev = entry
+        r = first + offset
+        _value(sheet, r, 1, market)
+        _value(sheet, r, 2, matchup)
+        _value(sheet, r, 3, pick, font=_BOLD)
+        _value(sheet, r, 4, confidence, PCT)
+        _value(sheet, r, 5, _simple_tier(confidence))
+        _value(sheet, r, 6, realised)
+        _value(sheet, r, 7, ev, "+0.000;-0.000")
+
+    last = first + len(entries)
+    _note(sheet, last + 1,
+          "Straight-up picks carry the model's own probability, because that is "
+          "the number that has been checked and holds: a stated 70% really has "
+          "won about 70%. EV is that probability against the posted price.")
+    _note(sheet, last + 2,
+          "Spread and total picks are rated a coin flip, because that is what "
+          f"nineteen seasons say they are -- {ats_rate:.1%} and {ou_rate:.1%} "
+          f"against the {config.BREAKEVEN_AT_STANDARD_VIG:.2%} needed to break "
+          "even at -110.")
+    _note(sheet, last + 3,
+          "Rating them by how far the model sits from the line is tempting and "
+          "wrong: the best-looking bucket is 60.9% on twenty-three bets. Those "
+          "per-bucket rates are in config.py for anyone who wants them, but they "
+          "do not survive their own sample sizes.")
+    _note(sheet, last + 4,
+          "EV is negative on nearly every row. That is the vig, it is the "
+          "measured result rather than a disclaimer, and it is why a model that "
+          "ties the closing line is a good forecast and still not a profitable "
+          "bet.")
+    _set_widths(sheet, [11, 16, 18, 12, 12, 24, 11])
+    sheet.freeze_panes = f"A{first}"
+
+
 def _build_simple_ratings(sheet, ratings, meta, scorecard) -> None:
     """Every team, strongest first."""
     row = _simple_title(sheet, "Power Ratings", meta, scorecard)
@@ -2091,6 +2224,7 @@ def export_simple_workbook(
     _build_simple_picker(
         sheets["Matchup Picker"], rec, team_data, slate, meta, scorecard
     )
+    _build_simple_picks(sheets["Betting Picks"], rec, slate, meta, scorecard)
     _build_simple_ratings(sheets["Power Ratings"], ratings, meta, scorecard)
     _build_simple_last_week(sheets["Last Week"], scorecard, meta)
 
