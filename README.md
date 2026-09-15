@@ -223,36 +223,35 @@ returns the live scorecard.
 
 ## The Excel workbook
 
-One workbook, sixteen tabs, built in about 30 seconds. It opens on **Start
-Here** — the week at a glance, then a linked index of every tab.
+`nflpredict predict` writes **six tabs and nothing else** — the week, in the
+order you would look at it:
 
 | Tab | What it holds |
 |---|---|
-| **Start Here** | The week at a glance, and a link to everything else |
-| Predictions | Pick, win %, confidence, model spread vs. the line, **fair moneyline vs. the book's price, EV per $1**, and a column for your own picks |
-| **Matchup Picker** | Two dropdowns — pick any teams, everything recalculates live |
-| Point Totals | Model total, posted total, the blend, over/under and P(over) |
-| Team Totals | Each side's points and the first-half split, as live formulas |
-| Player Projections | Projected passing, rushing and receiving yards |
-| Season Scorecard | How this season's picks have actually landed, week by week |
-| Power Ratings | Every franchise's Elo, in points |
-| Team Data | The per-team figures the Matchup Picker reads |
-| Backtest Summary | Model vs. market vs. Elo vs. picking the home team |
-| Calibration | Whether a stated 70% wins 70% |
-| Against the Spread | ATS record at six edge thresholds |
-| Point Totals Backtest | MAE, RMSE and bias, plus the over/under record |
-| Accuracy by Season | Year-by-year out-of-sample results |
-| Game Log | Every backtested game, one row each |
-| Read Me | What everything means, and how accurate it honestly is |
+| **Predictions** | Who wins, how sure, fair odds against the book's, and a column for your own picks |
+| **Spread** | The model's number against the posted line, and the gap |
+| **Point Totals** | How many points, and which side of the total it leans |
+| **Player Projections** | Projected passing, rushing and receiving yards |
+| **Matchup Picker** | Two dropdowns — pick any teams, everything recalculates |
+| **Power Ratings** | Every team, strongest first |
 
-**Yellow cells are yours to edit**; everything else is a formula you can
-click to check.
+About 20 KB, a few seconds to build. Each tab carries its own one-line
+accuracy note at the foot, so no claim travels without the number it applies
+to. **Yellow cells are yours to edit**; everything else is a formula.
+
+`nflpredict export`, or `predict --full`, writes the long version instead:
+the same six plus Start Here, Team Totals, Season Scorecard, Team Data,
+Backtest Summary, Calibration, Against the Spread, Point Totals Backtest,
+Accuracy by Season, Game Log and Read Me. That one is for checking the
+model's homework; the short one is for reading the week.
 
 ### The Matchup Picker
 
 Choose any two teams from the dropdowns and the whole panel recalculates —
-spread, both moneylines, total, both team totals — as Excel formulas over the
-Team Data tab. No regeneration, no Python.
+spread, both moneylines, total, both team totals — as Excel formulas. No
+regeneration, no Python. In the short workbook the figures it reads live in
+hidden columns on the picker itself, because a lookup table is not something
+anyone wants to look at and six tabs should not spend one on plumbing.
 
 Where the chosen pair is actually on this week's slate, the sheet also shows
 what the full model says, **because the two will not agree**. This week it
@@ -504,15 +503,34 @@ quarterbacks and the injury report all move during a week; seasons that have
 finished do not, and re-fetching twenty of them daily would be twenty minutes
 of downloading to discover nothing had happened.
 
-**It also runs itself.** `.github/workflows/refresh.yml` rebuilds the
-workbook every morning at 11:00 UTC and publishes it two ways: as an artifact
-on the run, and as an asset on a `latest` release, so there is always a
-stable URL pointing at the newest build. It can also be triggered by hand
-from the Actions tab, optionally for a specific week.
+**It also runs itself**, so week to week there is nothing to do.
 
-The schedule rolls the slate forward on its own — once a week is mostly
-played, the model starts predicting the next one — so nothing needs asking
-for again.
+`.github/workflows/refresh.yml` rebuilds the workbook every morning at 11:00
+UTC and publishes it two ways:
+
+- **[nflpredict-latest.xlsx](../../releases/download/latest/nflpredict-latest.xlsx)**
+  on the `latest` release — a fixed filename, so this link always serves the
+  newest build and is safe to bookmark.
+- An artifact on each run, named for the week it covers, kept 90 days.
+
+To pull a week early, or rebuild a specific one: Actions → *Refresh workbook*
+→ *Run workflow*, optionally with a season and week. Locally, `nflpredict
+refresh` does the same thing.
+
+### What changes through a week
+
+Nothing needs asking for again, because every part of the week arrives on its
+own schedule:
+
+| When | What the rebuild picks up |
+|---|---|
+| Mon–Tue | Last week's results. The Season Scorecard grades every pick, and the slate rolls forward once a week is mostly played. |
+| Wed–Fri | Injury reports publish, so the availability term stops reading "nobody is hurt" and player projections get scaled by who is actually expected to play. |
+| Sat–Sun | Lines and listed starters firm up, which is most of what moves a number. |
+
+The backtest grows with the season too: each finished game becomes another
+row behind the accuracy figures, and the walk-forward cache notices and
+recomputes.
 
 The walk-forward backtest is cached and keyed on everything that could change
 its answer: completed games, seasons, blend weights, and whether the passer

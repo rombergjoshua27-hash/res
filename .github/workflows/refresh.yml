@@ -71,6 +71,10 @@ jobs:
           path="$(ls -t out/*.xlsx | head -1)"
           echo "path=$path" >> "$GITHUB_OUTPUT"
           echo "name=$(basename "$path")" >> "$GITHUB_OUTPUT"
+          # A second copy under a name that never changes. The dated name
+          # identifies which week a build covers; the fixed one is what a
+          # bookmark can point at.
+          cp "$path" "nflpredict-latest.xlsx"
 
       # Two ways to get at it: an artifact on this run, and a release asset at
       # a stable URL that always points at the newest build.
@@ -81,6 +85,12 @@ jobs:
           path: ${{ steps.workbook.outputs.path }}
           retention-days: 90
 
+      # The release carries exactly one asset, under a name that does not move.
+      # Uploading the dated filename instead would publish a *new* asset each
+      # time the slate rolled to a new week -- --clobber only replaces a
+      # same-named one -- so the download URL would change weekly and the
+      # release would slowly fill up with every week of the season. The dated
+      # builds are still kept, as the per-run artifacts above.
       - name: Publish to the 'latest' release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -89,17 +99,25 @@ jobs:
           if ! gh release view latest >/dev/null 2>&1; then
             gh release create latest \
               --title "Latest workbook" \
-              --notes "Rebuilt automatically every morning. The asset below is always the newest build."
+              --notes "Rebuilt automatically every morning."
           fi
-          gh release upload latest "${{ steps.workbook.outputs.path }}" --clobber
-          gh release edit latest \
-            --notes "Rebuilt $(date -u '+%Y-%m-%d %H:%M UTC'). Asset: ${{ steps.workbook.outputs.name }}"
+          gh release upload latest "nflpredict-latest.xlsx" --clobber
+          gh release edit latest --notes "$(cat <<NOTES
+          **[Download nflpredict-latest.xlsx](https://github.com/${{ github.repository }}/releases/download/latest/nflpredict-latest.xlsx)** — this link always serves the newest build, so it is safe to bookmark.
+
+          Currently: **${{ steps.workbook.outputs.name }}**
+          Rebuilt: $(date -u '+%Y-%m-%d %H:%M UTC')
+
+          Rebuilt every morning at 11:00 UTC. The slate rolls forward on its own once a week is mostly played, and results are graded on the Season Scorecard tab as they land.
+          NOTES
+          )"
 
       - name: Summary
         run: |
           {
             echo "### Workbook rebuilt"
             echo ""
-            echo "- **File:** \`${{ steps.workbook.outputs.name }}\`"
-            echo "- **Download:** the run artifact above, or the [\`latest\` release](../../releases/tag/latest)"
+            echo "- **Covers:** \`${{ steps.workbook.outputs.name }}\`"
+            echo "- **Stable link:** [nflpredict-latest.xlsx](../../releases/download/latest/nflpredict-latest.xlsx)"
+            echo "- **This run's copy:** the artifact above"
           } >> "$GITHUB_STEP_SUMMARY"

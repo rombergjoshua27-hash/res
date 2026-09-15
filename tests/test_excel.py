@@ -81,6 +81,7 @@ def workbook(tmp_path_factory, games, team_epa):
             "spread_vs_average": np.linspace(-4.0, 6.0, len(slate_teams)),
         }
     )
+    export_workbook.inputs = (slate, engine_ratings, team_data, None, None)
     path = tmp_path_factory.mktemp("xlsx") / "out.xlsx"
     export_workbook(
         path,
@@ -103,6 +104,24 @@ def workbook(tmp_path_factory, games, team_epa):
         },
     )
     return path, result
+
+
+@pytest.fixture(scope="module")
+def workbook_inputs(workbook):
+    """The same slate, ratings and metadata the full workbook was built from."""
+    from nflpredict.excel import export_workbook
+
+    slate, ratings, team_data, props, _ = export_workbook.inputs
+    meta = {
+        "generated": "2026-09-15 04:00",
+        "slate_season": 2022,
+        "slate_week": 1,
+        "slate_train": 1000,
+        "market_blend": 0.10,
+        "total_blend": 0.10,
+        "hfa_points": 2.0,
+    }
+    return slate, ratings, team_data, props, meta
 
 
 def test_workbook_has_every_expected_sheet(workbook):
@@ -330,3 +349,102 @@ def test_the_picker_lookup_block_is_hidden(workbook):
     sheet = load_workbook(path)["Predictions"]
     for column in ("Z", "AA", "AB", "AC"):
         assert sheet.column_dimensions[column].hidden
+
+
+# --------------------------------------------------------------------------
+# The simple workbook
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def simple_workbook(tmp_path_factory, workbook_inputs):
+    """The six-tab workbook, built from the same slate as the full one."""
+    from nflpredict.excel import export_simple_workbook
+
+    slate, ratings, team_data, props, meta = workbook_inputs
+    path = tmp_path_factory.mktemp("simple") / "simple.xlsx"
+    export_simple_workbook(
+        path, slate=slate, ratings=ratings, team_data=team_data,
+        props=props, meta=meta,
+    )
+    return path
+
+
+def test_the_simple_workbook_has_exactly_the_six_tabs(simple_workbook):
+    """The point of this workbook is what it leaves out."""
+    assert load_workbook(simple_workbook).sheetnames == [
+        "Predictions", "Spread", "Point Totals", "Player Projections",
+        "Matchup Picker", "Power Ratings",
+    ]
+
+
+def test_it_opens_on_predictions(simple_workbook):
+    assert load_workbook(simple_workbook).active.title == "Predictions"
+
+
+def test_it_carries_no_backtest_pages(simple_workbook):
+    """The evidence lives in the full workbook; this one is the week."""
+    names = set(load_workbook(simple_workbook).sheetnames)
+    assert not names & {
+        "Game Log", "Backtest Summary", "Calibration", "Against the Spread",
+        "Point Totals Backtest", "Accuracy by Season", "Read Me", "Start Here",
+        "Team Data",
+    }
+
+
+def test_the_picker_carries_its_own_lookup_data(simple_workbook):
+    """No helper tab: the reference block is hidden on the picker itself."""
+    picker = load_workbook(simple_workbook)["Matchup Picker"]
+    for column in ("J", "K", "L", "M", "N"):
+        assert picker.column_dimensions[column].hidden
+    # And it must actually hold teams, or every formula below resolves to #N/A.
+    teams = [picker.cell(r, 10).value for r in range(2, 40)]
+    assert len([t for t in teams if t]) >= 2
+
+
+def test_the_picker_still_computes_from_formulas(simple_workbook):
+    picker = load_workbook(simple_workbook)["Matchup Picker"]
+    formulas = [
+        picker.cell(r, 2).value
+        for r in range(11, 19)
+        if isinstance(picker.cell(r, 2).value, str)
+    ]
+    assert len(formulas) >= 6
+    assert all(f.startswith("=") for f in formulas)
+    assert any("VLOOKUP" in f for f in formulas)
+
+
+def test_the_pickers_arithmetic_still_reconciles(simple_workbook):
+    picker = load_workbook(simple_workbook, data_only=True)["Matchup Picker"]
+    spread, total = picker["B11"].value, picker["B16"].value
+    home, away = picker["B17"].value, picker["B18"].value
+    assert home + away == pytest.approx(total, abs=1e-6)
+    assert home - away == pytest.approx(spread, abs=1e-6)
+
+
+def test_the_spread_tab_quotes_both_numbers_from_the_home_side(simple_workbook):
+    """Line and Model must be comparable, or Edge is meaningless."""
+    sheet = load_workbook(simple_workbook, data_only=True)["Spread"]
+    headers = [sheet.cell(4, c).value for c in range(1, 7)]
+    assert headers == ["Away", "Home", "Line", "Model", "Edge", "Model likes"]
+    line, model, edge = (sheet.cell(5, c).value for c in (3, 4, 5))
+    assert edge == pytest.approx(model - line, abs=1e-6)
+
+
+def test_every_simple_tab_says_how_accurate_it_is(simple_workbook):
+    """Trimming the Read Me must not strip the claims off the numbers."""
+    book = load_workbook(simple_workbook)
+    for name in ("Predictions", "Spread", "Point Totals"):
+        text = " ".join(
+            str(cell.value)
+            for row in book[name].iter_rows()
+            for cell in row
+            if isinstance(cell.value, str)
+        )
+        assert "%" in text
+        assert any(word in text for word in ("loses", "level with", "misses"))
+
+
+def test_the_simple_workbook_stays_small(simple_workbook):
+    """No game log means this should be kilobytes, not megabytes."""
+    assert simple_workbook.stat().st_size < 400_000
