@@ -102,6 +102,19 @@ jobs:
               --notes "Rebuilt automatically every morning."
           fi
           gh release upload latest "nflpredict-latest.xlsx" --clobber
+
+          # Keep the release to that one asset. Before it had a fixed name,
+          # each rebuild published its own dated file, and --clobber only
+          # replaces a same-named one -- so without this they accumulate and
+          # the newest stops being the obvious one to click. This also clears
+          # the files left behind by that earlier behaviour.
+          gh release view latest --json assets --jq '.assets[].name' \
+            | while read -r other; do
+                if [ -n "$other" ] && [ "$other" != "nflpredict-latest.xlsx" ]; then
+                  echo "removing stray asset: $other"
+                  gh release delete-asset latest "$other" --yes
+                fi
+              done
           gh release edit latest --notes "$(cat <<NOTES
           **[Download nflpredict-latest.xlsx](https://github.com/${{ github.repository }}/releases/download/latest/nflpredict-latest.xlsx)** — this link always serves the newest build, so it is safe to bookmark.
 
