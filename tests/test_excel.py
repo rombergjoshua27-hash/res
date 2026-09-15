@@ -69,11 +69,24 @@ def workbook(tmp_path_factory, games, team_epa):
     engine_ratings = pd.DataFrame(
         {"team": ["KC", "BUF"], "elo": [1650.0, 1600.0], "spread_vs_average": [6.0, 4.0]}
     )
+    # Cover every team on the slate, so the picker's default matchup resolves.
+    slate_teams = sorted(set(slate["home_team"]) | set(slate["away_team"]))
+    team_data = pd.DataFrame(
+        {
+            "team": slate_teams,
+            "games": 17,
+            "points_for": np.linspace(18.0, 30.0, len(slate_teams)),
+            "points_against": np.linspace(28.0, 18.0, len(slate_teams)),
+            "elo": np.linspace(1400.0, 1650.0, len(slate_teams)),
+            "spread_vs_average": np.linspace(-4.0, 6.0, len(slate_teams)),
+        }
+    )
     path = tmp_path_factory.mktemp("xlsx") / "out.xlsx"
     export_workbook(
         path,
         slate=slate,
         ratings=engine_ratings,
+        team_data=team_data,
         result=result,
         meta={
             "generated": "2026-09-13 12:00",
@@ -85,6 +98,8 @@ def workbook(tmp_path_factory, games, team_epa):
             "market_blend": 0.10,
             "total_blend": 0.10,
             "total_sigma": 13.3,
+            "hfa_points": 2.0,
+            "team_window": 17,
         },
     )
     return path, result
@@ -93,10 +108,11 @@ def workbook(tmp_path_factory, games, team_epa):
 def test_workbook_has_every_expected_sheet(workbook):
     path, _ = workbook
     assert load_workbook(path).sheetnames == [
-        "Read Me", "Predictions", "Point Totals", "Team Totals",
-        "Player Projections", "Season Scorecard", "Power Ratings",
-        "Backtest Summary", "Calibration", "Against the Spread",
-        "Point Totals Backtest", "Accuracy by Season", "Game Log",
+        "Start Here", "Predictions", "Matchup Picker", "Point Totals",
+        "Team Totals", "Player Projections", "Season Scorecard",
+        "Power Ratings", "Team Data", "Backtest Summary", "Calibration",
+        "Against the Spread", "Point Totals Backtest",
+        "Accuracy by Season", "Game Log", "Read Me",
     ]
 
 
@@ -202,3 +218,115 @@ def test_game_log_row_count_matches_the_predictions(workbook):
     path, result = workbook
     sheet = load_workbook(path)["Game Log"]
     assert sheet.max_row == len(result.predictions) + 1
+
+
+# --------------------------------------------------------------------------
+# Navigation and the interactive sheet
+# --------------------------------------------------------------------------
+
+
+def test_the_front_page_links_to_every_other_tab(workbook):
+    """A workbook this wide is only usable if you can get around it."""
+    path, _ = workbook
+    book = load_workbook(path)
+    start = book["Start Here"]
+
+    linked = {
+        cell.hyperlink.location.split("!")[0].strip("'")
+        for row in start.iter_rows()
+        for cell in row
+        if cell.hyperlink is not None
+    }
+    expected = set(book.sheetnames) - {"Start Here"}
+    assert expected <= linked, f"no link to {sorted(expected - linked)}"
+
+
+def test_every_tab_links_back_to_the_front_page(workbook):
+    path, _ = workbook
+    book = load_workbook(path)
+    for name in book.sheetnames:
+        if name == "Start Here":
+            continue
+        sheet = book[name]
+        targets = [
+            cell.hyperlink.location
+            for row in sheet.iter_rows(min_row=1, max_row=1)
+            for cell in row
+            if cell.hyperlink is not None
+        ]
+        assert any("Start Here" in t for t in targets), f"{name} has no way back"
+
+
+def test_the_workbook_opens_on_the_front_page(workbook):
+    path, _ = workbook
+    book = load_workbook(path)
+    assert book.active.title == "Start Here"
+
+
+def test_the_matchup_picker_offers_every_team_as_a_choice(workbook):
+    path, _ = workbook
+    picker = load_workbook(path)["Matchup Picker"]
+    validations = picker.data_validations.dataValidation
+    team_lists = [dv for dv in validations if "Team Data" in str(dv.formula1)]
+    assert team_lists, "no team dropdown on the picker"
+    covered = " ".join(str(dv.sqref) for dv in team_lists)
+    assert "B5" in covered and "B6" in covered
+
+
+def test_the_picker_computes_from_formulas_not_fixed_numbers(workbook):
+    """Changing a dropdown has to move the answer, which means formulas."""
+    path, _ = workbook
+    picker = load_workbook(path)["Matchup Picker"]
+    formulas = [
+        picker.cell(r, 2).value
+        for r in range(12, 20)
+        if isinstance(picker.cell(r, 2).value, str)
+    ]
+    assert len(formulas) >= 6
+    assert all(f.startswith("=") for f in formulas)
+    # Each must actually read the dropdowns, directly or through another cell.
+    assert any("VLOOKUP" in f for f in formulas)
+
+
+def test_the_picker_agrees_with_its_own_arithmetic(workbook):
+    """Team totals must add back to the total and differ by the spread."""
+    path, _ = workbook
+    picker = load_workbook(path, data_only=True)["Matchup Picker"]
+    spread = picker["B12"].value
+    total = picker["B17"].value
+    home, away = picker["B18"].value, picker["B19"].value
+    assert home + away == pytest.approx(total, abs=1e-6)
+    assert home - away == pytest.approx(spread, abs=1e-6)
+
+
+def test_the_picker_prices_the_favourite_negative(workbook):
+    path, _ = workbook
+    picker = load_workbook(path, data_only=True)["Matchup Picker"]
+    home_prob, home_ml = picker["B13"].value, picker["B15"].value
+    assert (home_prob >= 0.5) == (home_ml < 0)
+
+
+def test_team_data_carries_a_row_for_every_rated_team(workbook):
+    path, _ = workbook
+    sheet = load_workbook(path, data_only=True)["Team Data"]
+    teams = [sheet.cell(r, 1).value for r in range(5, 40) if sheet.cell(r, 1).value]
+    assert len(teams) >= 2
+    assert len(teams) == len(set(teams))
+
+
+def test_the_predictions_sheet_has_an_editable_pick_column(workbook):
+    path, _ = workbook
+    sheet = load_workbook(path)["Predictions"]
+    headers = [sheet.cell(4, c).value for c in range(1, 19)]
+    assert "My pick" in headers
+    assert "My result" in headers
+    # And the grading column must be a formula, not a blank waiting on Python.
+    assert str(sheet.cell(5, 18).value).startswith("=")
+
+
+def test_the_picker_lookup_block_is_hidden(workbook):
+    """It exists for formulas, not for reading."""
+    path, _ = workbook
+    sheet = load_workbook(path)["Predictions"]
+    for column in ("Z", "AA", "AB", "AC"):
+        assert sheet.column_dimensions[column].hidden

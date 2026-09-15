@@ -21,9 +21,10 @@ import pandas as pd
 
 from . import config, report
 from .backtest import track_season, walk_forward
+from .cache import cached_walk_forward
 from .data import load_games, load_half_scores, load_team_game_epa
 from .players import load_injuries, load_player_weeks
-from .props import PropsPredictor, build_player_features, build_slate_rows
+from .props import PropsPredictor, build_props_frames
 from .edge import attach_edges
 from .elo import EloEngine
 from .features import build_features
@@ -138,24 +139,19 @@ def _project_props(features, slate, season, week, args, team_points):
     if player_weeks is None or player_weeks.empty:
         return pd.DataFrame()
 
-    period = season * 100 + week
-    played = player_weeks[player_weeks["season"] * 100 + player_weeks["week"] < period]
-    if len(played) < 5000:
-        return pd.DataFrame()
-
-    injuries = getattr(args, "_injuries", pd.DataFrame())
-    games = getattr(args, "_games", None)
-    history = build_player_features(played, games, injuries, team_points)
-    if history.empty:
+    history, rows = build_props_frames(
+        player_weeks,
+        getattr(args, "_games", None),
+        slate,
+        getattr(args, "_injuries", pd.DataFrame()),
+        team_points,
+    )
+    if history.empty or rows.empty or len(history) < 5000:
         return pd.DataFrame()
 
     try:
         model = PropsPredictor().fit(history)
     except ValueError:
-        return pd.DataFrame()
-
-    rows = build_slate_rows(played, games, slate, injuries, team_points)
-    if rows.empty:
         return pd.DataFrame()
 
     projections = model.predict(rows)
@@ -307,9 +303,22 @@ def cmd_predict(args) -> int:
         print(report.format_scorecard(scorecard))
 
     if not args.no_excel:
-        print("\n" + _write_slate_workbook(enriched, features, season, week, args,
-                                            predictor, totals, history, props,
-                                            scorecard))
+        result, hit = cached_walk_forward(
+            features,
+            start_season=getattr(args, "start", None) or config.DEFAULT_BACKTEST_START,
+            use_market=not args.no_market,
+            market_blend=args.market_blend,
+            total_blend=args.total_blend,
+            use_qb_features=_qb_features_enabled(args),
+            refit="season",
+            quiet=args.quiet,
+        )
+        if not args.quiet and not hit:
+            print("\nBacktesting once so the workbook carries its own evidence ...")
+        print("\n" + _write_workbook(
+            enriched, season, week, args, predictor, totals, history,
+            props, scorecard, result,
+        ))
 
     if args.csv:
         columns = [
@@ -327,22 +336,58 @@ def cmd_predict(args) -> int:
     return 0
 
 
-def _write_slate_workbook(
-    enriched, features, season: int, week: int, args, predictor, totals, history,
-    props=None, scorecard=None,
-) -> str:
-    """Write the slate-only workbook and return a line describing where it went.
+def _team_table(games: pd.DataFrame, ratings: pd.DataFrame, *, window: int = 17) -> pd.DataFrame:
+    """Per-team reference figures for the workbook's Matchup Picker.
 
-    Separate from ``export`` because this one skips the backtest entirely: a
-    weekly run should cost a second, not the several minutes it takes to
-    replay nineteen seasons.
+    Scoring is a plain per-game average over each team's last ``window``
+    games, not opponent-adjusted. That is a real simplification against the
+    model's own features, and the sheet says so -- but it is what fits in a
+    spreadsheet formula, and a reader can check it by hand.
     """
+    played = games[games["completed"]].sort_values(
+        ["season", "week", "kickoff"], kind="mergesort"
+    )
+    if played.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for team in sorted(set(played["home_team"]) | set(played["away_team"])):
+        theirs = played[
+            (played["home_team"] == team) | (played["away_team"] == team)
+        ].tail(window)
+        if theirs.empty:
+            continue
+        at_home = theirs["home_team"] == team
+        points_for = theirs["home_score"].where(at_home, theirs["away_score"])
+        points_against = theirs["away_score"].where(at_home, theirs["home_score"])
+        rows.append(
+            {
+                "team": team,
+                "games": int(len(theirs)),
+                "points_for": float(points_for.mean()),
+                "points_against": float(points_against.mean()),
+            }
+        )
+
+    table = pd.DataFrame(rows)
+    if ratings is not None and not ratings.empty:
+        table = table.merge(ratings, on="team", how="left")
+    return table
+
+
+def _write_workbook(
+    enriched, season: int, week: int, args, predictor, totals, history,
+    props=None, scorecard=None, result=None,
+) -> str:
+    """Write the one workbook and return a line saying where it went."""
     from datetime import datetime
 
-    from .excel import export_slate_workbook
+    from .excel import export_workbook
 
+    games = load_games(quiet=True)
     engine = EloEngine(use_qb=args.qb_adjustment)
-    engine.run(load_games(quiet=True))
+    engine.run(games)
+    ratings = engine.current_ratings()
 
     meta = {
         "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -353,16 +398,43 @@ def _write_slate_workbook(
         "total_blend": args.total_blend,
         "total_sigma": totals.report.sigma,
         "slate_history_note": _history_note(history, season).lstrip(", "),
+        "team_window": 17,
+        "hfa_points": _current_hfa(games, season),
     }
+    if result is not None:
+        meta["start"] = args.start if getattr(args, "start", None) else config.DEFAULT_BACKTEST_START
+        meta["end"] = int(result.predictions["season"].max())
 
-    path = Path(args.excel) if args.excel else (
-        config.OUTPUT_DIR / f"slate_{season}_wk{week:02d}.xlsx"
+    path = Path(args.excel) if getattr(args, "excel", None) else (
+        config.OUTPUT_DIR / f"nflpredict_{season}_wk{week:02d}.xlsx"
     )
-    export_slate_workbook(
-        path, slate=enriched, ratings=engine.current_ratings(), meta=meta,
-        props=props, scorecard=scorecard,
+    export_workbook(
+        path,
+        slate=enriched,
+        ratings=ratings,
+        result=result,
+        meta=meta,
+        props=props,
+        scorecard=scorecard,
+        team_data=_team_table(games, ratings),
     )
-    return f"Workbook written to {path}"
+    return (
+        f"Workbook written to {path}\n"
+        f"  {getattr(export_workbook, 'sheet_count', 0)} tabs | {len(enriched)} games "
+        f"| {len(ratings)} teams | "
+        f"{len(result.predictions):,} backtested games" if result is not None
+        else f"Workbook written to {path}"
+    )
+
+
+def _current_hfa(games: pd.DataFrame, season: int) -> float:
+    """Home-field advantage in points, as the Elo engine currently measures it."""
+    from .elo import estimate_hfa
+
+    try:
+        return float(estimate_hfa(games, season))
+    except Exception:  # noqa: BLE001 - fall back rather than fail the workbook
+        return float(config.HFA_POINTS_DEFAULT)
 
 
 def _history_note(history: pd.DataFrame, season: int) -> str:
@@ -450,23 +522,14 @@ def cmd_evaluate(args) -> int:
 
 
 def cmd_export(args) -> int:
-    """Write every model output to a multi-sheet Excel workbook."""
-    from datetime import datetime
-
+    """Write the workbook with a freshly computed backtest."""
     _guard_warmup_season(args)
 
-    from .excel import export_workbook
-
     _, features = _build(args)
-
     season, week = _target_slate(features, args)
     slate_out, predictor, totals, history, splits, props, scorecard = _predict_slate(
         features, season, week, args
     )
-
-    engine = EloEngine(use_qb=args.qb_adjustment)
-    engine.run(load_games(quiet=args.quiet))
-    ratings = engine.current_ratings()
 
     if not args.quiet:
         print(f"Backtesting {args.start}-{args.end or 'latest'} for the workbook ...")
@@ -482,32 +545,10 @@ def cmd_export(args) -> int:
         quiet=args.quiet,
     )
 
-    meta = {
-        "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "start": args.start,
-        "end": args.end or int(result.predictions["season"].max()),
-        "slate_season": season,
-        "slate_week": week,
-        "slate_train": predictor.report.n_train,
-        "market_blend": args.market_blend,
-        "total_blend": args.total_blend,
-        "total_sigma": totals.report.sigma,
-        "slate_history_note": _history_note(history, season).lstrip(", "),
-    }
-
-    path = Path(args.output) if args.output else (
-        config.OUTPUT_DIR / f"nflpredict_{season}_wk{week:02d}.xlsx"
-    )
-    export_workbook(
-        path, slate=slate_out, ratings=ratings, result=result,
-        meta=meta, props=props, scorecard=scorecard,
-    )
-    print(f"Workbook written to {path}")
-    print(
-        f"  {getattr(export_workbook, 'sheet_count', 0)} sheets | "
-        f"{len(slate_out)} slate games | {len(ratings)} teams | "
-        f"{len(result.predictions):,} backtested games"
-    )
+    print(_write_workbook(
+        slate_out, season, week, args, predictor, totals, history,
+        props, scorecard, result,
+    ))
     return 0
 
 

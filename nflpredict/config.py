@@ -224,9 +224,13 @@ EPA_BLEND_FULL_GAMES = 6.0    # games before current season fully displaces prio
 # Model / blending
 # --------------------------------------------------------------------------
 
-# Seasons before this are used to warm up Elo but never scored in a backtest,
-# because play-by-play EPA features need a season of history.
-DEFAULT_BACKTEST_START = 2007
+# Seasons before this are used to warm up Elo and the rolling form but never
+# scored in a backtest. With play-by-play loaded from 2006, 2006 centres its
+# own league baselines (see features._league_baselines) and 2007 is the first
+# season with a full prior season of form behind every team -- so scoring
+# starts at 2008, one clear season after that. Every accuracy figure this
+# project publishes is measured on this default.
+DEFAULT_BACKTEST_START = 2008
 MIN_TRAIN_SEASONS = 4
 
 # Weight on the model when blending with the market price.

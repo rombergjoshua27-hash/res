@@ -32,11 +32,13 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill
 from openpyxl.styles.borders import Side
-from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.hyperlink import Hyperlink
+from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 
 from . import config
 
-__all__ = ["export_workbook", "export_slate_workbook"]
+__all__ = ["export_workbook"]
 
 FONT = "Arial"
 
@@ -617,7 +619,7 @@ def _build_predictions(sheet, rec: Recorder, slate: pd.DataFrame, meta: dict) ->
         sheet, row,
         ["Away", "Home", "Pick", "Win %", "Confidence", "Model", "Line", "Edge",
          "Market Win %", "P(home)", "P(home) mkt", "Actual", "Outcome",
-         "Fair ML", "Book ML", "EV / $1"],
+         "Fair ML", "Book ML", "EV / $1", "My pick", "My result"],
     )
 
     first = row + 1
@@ -683,6 +685,29 @@ def _build_predictions(sheet, rec: Recorder, slate: pd.DataFrame, meta: dict) ->
             "+0.000;-0.000",
         )
 
+        # Yours to fill in: pick a side and the sheet grades it beside the
+        # model's, so a disagreement is visible rather than remembered.
+        pick_cell = _value(sheet, r, 17, None)
+        pick_cell.font = _INPUT_FONT
+        pick_cell.fill = _ASSUMPTION_FILL
+        own_pick = DataValidation(
+            type="list", formula1=f"=$A${r}:$B${r}", allow_blank=True
+        )
+        sheet.add_data_validation(own_pick)
+        own_pick.add(pick_cell)
+        rec.formula(
+            sheet, r, 18,
+            f'=IF(OR($Q{r}="",$L{r}=""),"",IF($L{r}=0,"PUSH",'
+            f'IF(OR(AND($Q{r}=$B{r},$L{r}>0),AND($Q{r}=$A{r},$L{r}<0)),"HIT","MISS")))',
+            "",
+        )
+
+        # Hidden lookup block for the Matchup Picker: away@home -> the numbers.
+        _value(sheet, r, 26, f"{game.away_team}@{game.home_team}")
+        _value(sheet, r, 27, _num(game.pred_margin), SPREAD)
+        _value(sheet, r, 28, prob, PCT)
+        _value(sheet, r, 29, _num(getattr(game, "pred_total", None)), "0.0")
+
     last = first + len(slate)
     _note(sheet, last + 1, "Edge = Model minus Line. A positive edge favours the home side.")
     _note(sheet, last + 2,
@@ -692,7 +717,17 @@ def _build_predictions(sheet, rec: Recorder, slate: pd.DataFrame, meta: dict) ->
           "Fair ML is the price the model's own probability implies, with no vig. "
           "Book ML is what is actually posted on that side. EV is per $1 staked at "
           "the book price -- negative almost everywhere, which is the vig working.")
-    _set_widths(sheet, [9, 9, 9, 10, 13, 9, 9, 9, 13, 11, 12, 9, 10, 10, 10, 10])
+    _note(sheet, last + 4,
+          "My pick (yellow) is a dropdown of the two teams. Fill it in and My "
+          "result grades it once the game lands, so your record sits next to the "
+          "model's rather than in your head.")
+    _set_widths(
+        sheet,
+        [9, 9, 9, 10, 13, 9, 9, 9, 13, 11, 12, 9, 10, 10, 10, 10, 11, 11],
+    )
+    # Columns Z-AC feed the Matchup Picker and are not meant to be read.
+    for column in ("Z", "AA", "AB", "AC"):
+        sheet.column_dimensions[column].hidden = True
     sheet.freeze_panes = f"A{first}"
 
 
@@ -1194,67 +1229,399 @@ def _build_read_me(sheet, meta: dict, *, content=None) -> None:
 # --------------------------------------------------------------------------
 
 
-SLATE_READ_ME = [
-    ("title", "nflpredict -- Slate Workbook"),
-    ("blank", ""),
-    ("head", "What is in here"),
-    ("text", "Predictions -- pick, win probability, confidence tier, the model's spread against the posted line, and its fair moneyline against the posted price."),
-    ("text", "Point Totals -- the model's own total, the posted total, the blend of the two, and the over/under it implies."),
-    ("text", "Team Totals -- each side's projected points and the first-half split, derived from the game total and the spread."),
-    ("text", "Player Projections -- projected passing, rushing and receiving yards for the players expected to appear."),
-    ("text", "Season Scorecard -- how this season's picks have actually landed, week by week, against the long-run figures."),
-    ("text", "Power Ratings -- every franchise's current Elo, and what it is worth in points."),
-    ("blank", ""),
-    ("head", "How accurate is it, honestly"),
-    ("text", "About two games in three. Walk-forward across 2008-2026 it hits 66.6% straight up, which is level with the Vegas closing line and no better than it. Roughly a third of NFL games turn on events with no predictable structure."),
-    ("text", "Against the spread it wins 49.6% and loses money at standard -110 pricing, where 52.38% is breakeven. Point totals miss the final number by about 10.7 points on average against the closing total's 10.5, and over/under picks hit 50.8%."),
-    ("text", "This workbook carries the slate only. For the full backtest evidence behind those figures -- calibration, per-season accuracy, the against-the-spread and over/under records, and the game-by-game log they are all computed from -- run:  nflpredict export"),
+# Every tab, with the one-line answer to "why would I open this".
+NAVIGATION = [
+    ("Predictions", "Who wins each game, by how much, and at what price"),
+    ("Matchup Picker", "Pick any two teams and see the projection update live"),
+    ("Point Totals", "How many points each game is projected to produce"),
+    ("Team Totals", "Each side's points, plus the first-half split"),
+    ("Player Projections", "Passing, rushing and receiving yards per player"),
+    ("Season Scorecard", "How this season's picks have actually landed"),
+    ("Power Ratings", "Every franchise's rating, in points"),
+    ("Team Data", "The per-team figures the Matchup Picker reads"),
+    ("Backtest Summary", "The model against the market, Elo, and picking the home team"),
+    ("Calibration", "Whether a stated 70% really wins 70% of the time"),
+    ("Against the Spread", "The spread record at six edge thresholds"),
+    ("Point Totals Backtest", "How far the totals forecast missed, and the over/under record"),
+    ("Accuracy by Season", "Year-by-year, out of sample"),
+    ("Game Log", "Every backtested game. All the summary tabs are formulas over this"),
+    ("Read Me", "What everything means, and how accurate it honestly is"),
 ]
 
 
-def export_slate_workbook(
-    path, *, slate: pd.DataFrame, ratings: pd.DataFrame, meta: dict,
-    props: pd.DataFrame | None = None, scorecard=None,
-) -> Path:
-    """Write the slate-only workbook: no backtest, so it takes a second.
+def _internal_link(cell, target: str) -> None:
+    """Point a cell at another sheet in this workbook.
 
-    Same sheets a reader looks at every week, without re-running 19 seasons
-    of walk-forward to produce them. ``export_workbook`` remains the full
-    article, and the Read Me here points at it.
+    Assigning a string to ``cell.hyperlink`` makes openpyxl write an
+    *external* relationship, which Excel then cannot follow back into its own
+    workbook. An internal jump has to set ``location`` instead, and a sheet
+    name containing a space has to be quoted inside it.
     """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    quoted = f"'{target}'" if " " in target else target
+    cell.hyperlink = Hyperlink(ref=cell.coordinate, location=f"{quoted}!A1")
 
-    workbook = Workbook()
-    workbook.remove(workbook.active)
-    workbook.calculation.fullCalcOnLoad = True
 
-    rec = Recorder()
-    sheets = {
-        name: workbook.create_sheet(name)
-        for name in (
-            "Read Me", "Predictions", "Point Totals", "Team Totals",
-            "Player Projections", "Season Scorecard", "Power Ratings",
+def _link(sheet, row: int, target: str, label: str, description: str) -> None:
+    """A clickable jump to another tab, with a line on why to go there."""
+    cell = sheet.cell(row=row, column=1, value=label)
+    _internal_link(cell, target)
+    cell.font = Font(name=FONT, size=11, bold=True, color="0563C1", underline="single")
+    _value(sheet, row, 2, description, font=_NOTE_FONT)
+
+
+def _build_start_here(sheet, slate: pd.DataFrame, meta: dict, scorecard) -> None:
+    """The front page: where you are, what the week looks like, where to go."""
+    sheet["A1"] = "nflpredict"
+    sheet["A1"].font = Font(name=FONT, size=20, bold=True, color="1F3864")
+    sheet["A2"] = (
+        f"{meta['slate_season']} Week {meta['slate_week']}  ·  "
+        f"{len(slate)} games  ·  generated {meta['generated']}"
+    )
+    sheet["A2"].font = _NOTE_FONT
+
+    row = 4
+    sheet.cell(row=row, column=1, value="This week at a glance").font = _SECTION_FONT
+    row += 1
+
+    headline = _headline_rows(slate, meta, scorecard)
+    for label, value in headline:
+        _value(sheet, row, 1, label, font=_BOLD)
+        _value(sheet, row, 2, value)
+        row += 1
+
+    row += 1
+    sheet.cell(row=row, column=1, value="Where to go").font = _SECTION_FONT
+    row += 1
+    for target, description in NAVIGATION:
+        _link(sheet, row, target, target, description)
+        row += 1
+
+    row += 1
+    sheet.cell(row=row, column=1, value="Before you read anything else").font = _SECTION_FONT
+    row += 1
+    for line in (
+        "This model is wrong about one game in three, and nothing will fix that.",
+        "It hits 66.6% straight up over 4,912 backtested games -- level with the "
+        "closing line, not better than it.",
+        "Against the spread it wins 49.6% and loses money at standard -110 pricing, "
+        "where 52.38% is breakeven.",
+        "Yellow cells are yours to edit. Everything else is a formula you can click "
+        "to check.",
+    ):
+        cell = sheet.cell(row=row, column=1, value=line)
+        cell.font = _BODY_FONT
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
+        row += 1
+
+    _set_widths(sheet, [34, 78])
+
+
+def _headline_rows(slate: pd.DataFrame, meta: dict, scorecard) -> list:
+    """The handful of numbers worth seeing before opening a tab."""
+    rows = []
+    if not slate.empty and "pick_prob" in slate.columns:
+        best = slate.loc[slate["pick_prob"].idxmax()]
+        rows.append(
+            (
+                "Most confident pick",
+                f"{best['pick']} over "
+                f"{best['away_team'] if best['pick'] == best['home_team'] else best['home_team']}"
+                f" ({float(best['pick_prob']):.0%})",
+            )
         )
-    }
+        coinflips = int((slate["pick_prob"] < 0.575).sum())
+        rows.append(("Coin-flip games this week", f"{coinflips} of {len(slate)}"))
+    if not slate.empty and "pred_total" in slate.columns:
+        highest = slate.loc[slate["pred_total"].idxmax()]
+        rows.append(
+            (
+                "Highest projected total",
+                f"{highest['away_team']} @ {highest['home_team']}"
+                f"  ({float(highest['pred_total']):.1f} points)",
+            )
+        )
+    if scorecard is not None and not getattr(scorecard, "games", pd.DataFrame()).empty:
+        summary = scorecard.summary
+        rows.append(
+            (
+                f"{scorecard.season} record so far",
+                f"{int(summary['correct'])} of {summary['games']} "
+                f"({summary['accuracy']:.1%}) straight up",
+            )
+        )
+    rows.append(
+        ("Games behind the accuracy figures", f"{meta.get('n_games', 0):,}")
+    )
+    rows.append(
+        ("Model fitted on", f"{meta['slate_train']:,} completed games")
+    )
+    if meta.get("slate_history_note"):
+        rows.append(("Includes this season", meta["slate_history_note"]))
+    return rows
 
-    _build_read_me(sheets["Read Me"], meta, content=SLATE_READ_ME)
-    _build_predictions(sheets["Predictions"], rec, slate, meta)
-    _build_totals_slate(sheets["Point Totals"], rec, slate, meta)
-    _build_team_totals(sheets["Team Totals"], rec, slate, meta)
-    _build_props(sheets["Player Projections"], props, meta)
-    _build_scorecard(sheets["Season Scorecard"], rec, scorecard, meta)
-    _build_ratings(sheets["Power Ratings"], rec, ratings)
 
-    workbook.save(path)
-    _inject_cached_values(path, rec)
-    export_slate_workbook.sheet_count = len(sheets)
-    return path
+def _build_team_data(sheet, team_data: pd.DataFrame, meta: dict) -> int:
+    """Per-team reference figures. The Matchup Picker reads from here.
+
+    Deliberately plain: a rating, a scoring rate, and a concession rate, in
+    the units the picker's formulas use. Anyone can check the arithmetic on
+    this sheet against the picker above it.
+
+    Returns the last populated row so the picker can size its lookups.
+    """
+    row = _write_title(
+        sheet,
+        "Team Data",
+        "What the Matchup Picker looks up. Elo is the model's power rating; "
+        "the scoring columns are per-game averages over each team's last "
+        f"{meta.get('team_window', 17)} games.",
+    )
+    _write_header(
+        sheet, row,
+        ["Team", "Elo", "Pts vs average", "Points for", "Points against", "Games"],
+    )
+
+    first = row + 1
+    if team_data is None or team_data.empty:
+        _note(sheet, first, "No team data available.")
+        _set_widths(sheet, [10, 10, 15, 12, 15, 9])
+        return first
+
+    ordered = team_data.sort_values("team")
+    for offset, team in enumerate(ordered.itertuples(index=False)):
+        r = first + offset
+        _value(sheet, r, 1, team.team)
+        _value(sheet, r, 2, _num(getattr(team, "elo", None)), "0")
+        _value(sheet, r, 3, _num(getattr(team, "spread_vs_average", None)), SPREAD)
+        _value(sheet, r, 4, _num(getattr(team, "points_for", None)), "0.0")
+        _value(sheet, r, 5, _num(getattr(team, "points_against", None)), "0.0")
+        _value(sheet, r, 6, _num(getattr(team, "games", None)), "0")
+
+    last = first + len(ordered) - 1
+    _note(sheet, last + 2,
+          f"{config.ELO_PER_POINT:.0f} Elo points = 1 point of spread. Points for "
+          "and against are raw per-game averages, not opponent-adjusted -- the "
+          "full model adjusts for schedule, the picker's quick estimate does not.")
+    _set_widths(sheet, [10, 10, 15, 12, 15, 9])
+    sheet.freeze_panes = f"A{first}"
+    return last
+
+
+def _build_matchup_picker(
+    sheet, rec: Recorder, team_data: pd.DataFrame, slate: pd.DataFrame,
+    meta: dict, data_last_row: int,
+) -> None:
+    """Pick any two teams and get a live projection.
+
+    Every number below is an Excel formula over the Team Data sheet, so
+    changing either dropdown recalculates the whole panel instantly -- no
+    Python, no regeneration. Matchups that happen to be on this week's slate
+    also show what the full model says, because the two will not agree and
+    pretending otherwise would be the dishonest part of this sheet.
+    """
+    row = _write_title(
+        sheet,
+        "Matchup Picker",
+        "Choose any two teams. Everything recalculates from the Team Data tab.",
+    )
+
+    if team_data is None or team_data.empty:
+        _note(sheet, row, "No team data available.")
+        return
+
+    teams = sorted(team_data["team"].astype(str))
+    default_away, default_home = (teams + ["", ""])[:2]
+    if not slate.empty:
+        first_game = slate.iloc[0]
+        default_away = str(first_game["away_team"])
+        default_home = str(first_game["home_team"])
+
+    lookup = f"'Team Data'!$A${5}:$F${data_last_row}"
+    away_cell, home_cell, neutral_cell = "B5", "B6", "B7"
+
+    # --- inputs
+    sheet.cell(row=4, column=1, value="Choose the matchup").font = _SECTION_FONT
+    for r, label, value in (
+        (5, "Away team", default_away),
+        (6, "Home team", default_home),
+        (7, "Neutral site?", "No"),
+    ):
+        _value(sheet, r, 1, label, font=_BOLD)
+        cell = _value(sheet, r, 2, value, font=_INPUT_FONT)
+        cell.fill = _ASSUMPTION_FILL
+
+    validation = DataValidation(
+        type="list", formula1=f"='Team Data'!$A$5:$A${data_last_row}", allow_blank=False
+    )
+    validation.error = "Pick a team from the list."
+    validation.prompt = "Choose a team"
+    sheet.add_data_validation(validation)
+    validation.add(sheet[away_cell])
+    validation.add(sheet[home_cell])
+
+    neutral_validation = DataValidation(type="list", formula1='"No,Yes"', allow_blank=False)
+    sheet.add_data_validation(neutral_validation)
+    neutral_validation.add(sheet[neutral_cell])
+
+    _note(sheet, 8, "Yellow cells are yours to change. Everything else is a formula.")
+
+    # --- the projection
+    row = 10
+    sheet.cell(row=row, column=1, value="Projection").font = _SECTION_FONT
+    row += 1
+    _write_header(sheet, row, ["Measure", "Value", "How it is worked out"])
+    row += 1
+
+    hfa = float(meta.get("hfa_points", config.HFA_POINTS_DEFAULT))
+    elo_per_point = config.ELO_PER_POINT
+    sigma = config.MARGIN_SIGMA
+
+    away_elo = f'VLOOKUP(${away_cell},{lookup},2,FALSE)'
+    home_elo = f'VLOOKUP(${home_cell},{lookup},2,FALSE)'
+    away_pf = f'VLOOKUP(${away_cell},{lookup},4,FALSE)'
+    home_pf = f'VLOOKUP(${home_cell},{lookup},4,FALSE)'
+    away_pa = f'VLOOKUP(${away_cell},{lookup},5,FALSE)'
+    home_pa = f'VLOOKUP(${home_cell},{lookup},5,FALSE)'
+
+    hfa_term = f'IF(${neutral_cell}="Yes",0,{hfa})'
+    spread_formula = f"=({home_elo}-{away_elo})/{elo_per_point}+{hfa_term}"
+    total_formula = f"=(({home_pf}+{away_pa})/2)+(({away_pf}+{home_pa})/2)"
+
+    rows_spec = [
+        ("Home spread", spread_formula, SPREAD,
+         f"Elo gap / {elo_per_point:.0f}, plus {hfa:.2f} home field"),
+        ("Home win probability", f"=NORM.DIST($B{row},0,{sigma},TRUE)", PCT,
+         f"Normal curve on the spread, sigma {sigma}"),
+        ("Away win probability", f"=1-$B{row + 1}", PCT, "The other side of it"),
+        ("Home fair moneyline",
+         f'=IF($B{row + 1}>=0.5,-100*$B{row + 1}/(1-$B{row + 1}),'
+         f'100*(1-$B{row + 1})/$B{row + 1})', "+0;-0", "The price that probability implies"),
+        ("Away fair moneyline",
+         f'=IF($B{row + 2}>=0.5,-100*$B{row + 2}/(1-$B{row + 2}),'
+         f'100*(1-$B{row + 2})/$B{row + 2})', "+0;-0", "Same, from the away side"),
+        ("Game total", total_formula, "0.0",
+         "Each side's scoring averaged with what the other allows"),
+        ("Home team total", f"=($B{row + 5}+$B{row})/2", "0.0", "Total and spread split"),
+        ("Away team total", f"=($B{row + 5}-$B{row})/2", "0.0", "The remainder"),
+    ]
+
+    values = _matchup_values(team_data, default_away, default_home, hfa)
+    for offset, (label, formula, fmt, explanation) in enumerate(rows_spec):
+        r = row + offset
+        _value(sheet, r, 1, label)
+        rec.formula(sheet, r, 2, formula, values[offset], fmt)
+        _value(sheet, r, 3, explanation, font=_NOTE_FONT)
+
+    last = row + len(rows_spec)
+
+    # --- what the full model says, where the two teams actually meet
+    last += 1
+    sheet.cell(row=last, column=1, value="On this week's slate").font = _SECTION_FONT
+    last += 1
+    key_range = _slate_key_range(slate)
+    if key_range:
+        _write_header(sheet, last, ["Measure", "Full model", "Picker estimate"])
+        last += 1
+        matched = (
+            f'IFERROR(VLOOKUP(${away_cell}&"@"&${home_cell},{key_range},'
+        )
+        # The cached value has to be the real lookup result, not a blank: a
+        # reader who never recalculates would otherwise see an empty column
+        # exactly where the comparison lives.
+        on_slate = slate[
+            (slate["away_team"] == default_away) & (slate["home_team"] == default_home)
+        ]
+        model_values = (
+            [
+                _num(on_slate["pred_margin"].iloc[0]),
+                _num(on_slate["prob_home"].iloc[0]),
+                _num(on_slate.get("pred_total", pd.Series([None])).iloc[0]),
+            ]
+            if not on_slate.empty
+            else ["not on this slate"] * 3
+        )
+        for offset, (label, column, fmt, picker_row) in enumerate(
+            (("Home spread", 2, SPREAD, row),
+             ("Home win probability", 3, PCT, row + 1),
+             ("Game total", 4, "0.0", row + 5)),
+        ):
+            r = last + offset
+            _value(sheet, r, 1, label)
+            rec.formula(
+                sheet, r, 2, f'={matched}{column},FALSE),"not on this slate")',
+                model_values[offset], fmt,
+            )
+            rec.formula(sheet, r, 3, f"=$B{picker_row}", values[picker_row - row], fmt)
+        last += 3
+    else:
+        _note(sheet, last, "No slate loaded, so there is nothing to compare against.")
+        last += 1
+
+    _note(sheet, last + 1,
+          "The picker and the full model will not agree, and that is expected. "
+          "The picker is Elo plus raw scoring averages, which is all that fits in "
+          "a spreadsheet formula. The full model adds EPA form, pace, weather, "
+          "rest, the passer, injuries -- and then blends toward the market.")
+    _note(sheet, last + 2,
+          "Treat the picker as a quick what-if for matchups nobody has priced, "
+          "and the Predictions tab as the actual forecast.")
+    _set_widths(sheet, [24, 16, 46])
+
+
+def _matchup_values(team_data: pd.DataFrame, away: str, home: str, hfa: float) -> list:
+    """The picker's formulas, computed in Python for the cached values."""
+    import numpy as np
+    from scipy.stats import norm
+
+    indexed = team_data.set_index("team")
+    if away not in indexed.index or home not in indexed.index:
+        return [None] * 8
+
+    def field(team: str, column: str) -> float:
+        value = indexed.loc[team].get(column)
+        return float(value) if value is not None and not pd.isna(value) else float("nan")
+
+    spread = (
+        field(home, "elo") - field(away, "elo")
+    ) / config.ELO_PER_POINT + hfa
+    home_prob = float(norm.cdf(spread / config.MARGIN_SIGMA))
+    away_prob = 1.0 - home_prob
+    total = (
+        (field(home, "points_for") + field(away, "points_against")) / 2.0
+        + (field(away, "points_for") + field(home, "points_against")) / 2.0
+    )
+
+    def american(prob: float) -> float:
+        if prob >= 0.5:
+            return -100.0 * prob / (1.0 - prob)
+        return 100.0 * (1.0 - prob) / prob
+
+    return [
+        spread, home_prob, away_prob, american(home_prob), american(away_prob),
+        total, (total + spread) / 2.0, (total - spread) / 2.0,
+    ]
+
+
+def _slate_key_range(slate: pd.DataFrame) -> str:
+    """The Predictions sheet's hidden lookup block, or '' when there is none."""
+    if slate is None or slate.empty:
+        return ""
+    first = 5  # Predictions data starts here
+    last = first + len(slate) - 1
+    return f"Predictions!$Z${first}:$AC${last}"
+
+
+def _add_back_link(sheet) -> None:
+    """A way home from every tab, so the workbook is navigable in both directions."""
+    cell = sheet.cell(row=1, column=column_index_from_string("H"), value="\u2190 Start Here")
+    _internal_link(cell, "Start Here")
+    cell.font = Font(name=FONT, size=9, color="0563C1", underline="single")
 
 
 def export_workbook(
     path, *, slate: pd.DataFrame, ratings: pd.DataFrame, result, meta: dict,
     props: pd.DataFrame | None = None, scorecard=None,
+    team_data: pd.DataFrame | None = None,
 ) -> Path:
     """Write the full multi-sheet workbook to ``path``."""
     path = Path(path)
@@ -1270,10 +1637,11 @@ def export_workbook(
     sheets = {
         name: workbook.create_sheet(name)
         for name in (
-            "Read Me", "Predictions", "Point Totals", "Team Totals",
-            "Player Projections", "Season Scorecard", "Power Ratings",
-            "Backtest Summary", "Calibration", "Against the Spread",
-            "Point Totals Backtest", "Accuracy by Season", "Game Log",
+            "Start Here", "Predictions", "Matchup Picker", "Point Totals",
+            "Team Totals", "Player Projections", "Season Scorecard",
+            "Power Ratings", "Team Data", "Backtest Summary", "Calibration",
+            "Against the Spread", "Point Totals Backtest",
+            "Accuracy by Season", "Game Log", "Read Me",
         )
     }
 
@@ -1289,7 +1657,12 @@ def export_workbook(
     }
 
     _build_read_me(sheets["Read Me"], meta)
+    _build_start_here(sheets["Start Here"], slate, meta, scorecard)
     _build_predictions(sheets["Predictions"], rec, slate, meta)
+    data_last_row = _build_team_data(sheets["Team Data"], team_data, meta)
+    _build_matchup_picker(
+        sheets["Matchup Picker"], rec, team_data, slate, meta, data_last_row
+    )
     _build_totals_slate(sheets["Point Totals"], rec, slate, meta)
     _build_team_totals(sheets["Team Totals"], rec, slate, meta)
     _build_props(sheets["Player Projections"], props, meta)
@@ -1300,6 +1673,11 @@ def export_workbook(
     _build_ats(sheets["Against the Spread"], rec, last_row, derived)
     _build_totals_backtest(sheets["Point Totals Backtest"], rec, last_row, derived)
     _build_by_season(sheets["Accuracy by Season"], rec, last_row, derived)
+
+    for name, sheet in sheets.items():
+        if name != "Start Here":
+            _add_back_link(sheet)
+    workbook.active = workbook.index(sheets["Start Here"])
 
     workbook.save(path)
     _inject_cached_values(path, rec)
