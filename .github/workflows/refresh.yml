@@ -1,0 +1,105 @@
+name: Refresh workbook
+
+# Runs every morning. Scores, closing lines, listed quarterbacks and the
+# injury report all move during a week, so a daily rebuild keeps the workbook
+# current without anyone asking for it. The schedule also rolls the slate
+# forward on its own: once a week is mostly played, the model starts
+# predicting the next one.
+on:
+  schedule:
+    # 11:00 UTC daily — after nflverse has published the overnight update,
+    # early enough to be there before the morning on either US coast.
+    - cron: "0 11 * * *"
+  workflow_dispatch:
+    inputs:
+      season:
+        description: "Season to predict (blank = current)"
+        required: false
+      week:
+        description: "Week to predict (blank = next unplayed)"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  # A manual run while the nightly one is going would fight over the cache.
+  group: refresh-workbook
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -e .
+
+      # Everything here is re-downloadable, but rebuilding twenty seasons of
+      # play-by-play every morning would be twenty minutes to discover that
+      # finished seasons had not changed. Raw play-by-play is deliberately not
+      # cached: it is ~350 MB and only ever an input to the summaries.
+      - name: Restore data cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/epa
+            data/players
+            data/backtest
+            data/games.csv
+          key: nflpredict-data-${{ github.run_id }}
+          restore-keys: |
+            nflpredict-data-
+
+      - name: Refresh and rebuild
+        run: |
+          nflpredict refresh --prune-raw --quiet \
+            ${{ github.event.inputs.season && format('--season {0}', github.event.inputs.season) || '' }} \
+            ${{ github.event.inputs.week && format('--week {0}', github.event.inputs.week) || '' }}
+
+      - name: Name the workbook
+        id: workbook
+        run: |
+          path="$(ls -t out/*.xlsx | head -1)"
+          echo "path=$path" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$path")" >> "$GITHUB_OUTPUT"
+
+      # Two ways to get at it: an artifact on this run, and a release asset at
+      # a stable URL that always points at the newest build.
+      - name: Upload as a run artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.workbook.outputs.name }}
+          path: ${{ steps.workbook.outputs.path }}
+          retention-days: 90
+
+      - name: Publish to the 'latest' release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if ! gh release view latest >/dev/null 2>&1; then
+            gh release create latest \
+              --title "Latest workbook" \
+              --notes "Rebuilt automatically every morning. The asset below is always the newest build."
+          fi
+          gh release upload latest "${{ steps.workbook.outputs.path }}" --clobber
+          gh release edit latest \
+            --notes "Rebuilt $(date -u '+%Y-%m-%d %H:%M UTC'). Asset: ${{ steps.workbook.outputs.name }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Workbook rebuilt"
+            echo ""
+            echo "- **File:** \`${{ steps.workbook.outputs.name }}\`"
+            echo "- **Download:** the run artifact above, or the [\`latest\` release](../../releases/tag/latest)"
+          } >> "$GITHUB_STEP_SUMMARY"

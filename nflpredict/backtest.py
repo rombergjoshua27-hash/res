@@ -13,7 +13,7 @@ prior games (see ``features``). Only the supervised models are refit.
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List
 
 import numpy as np
@@ -21,13 +21,19 @@ import pandas as pd
 
 from . import config
 from .model import GamePredictor
+from .splits import SplitPredictor
+from .totals import TotalsPredictor
 
 __all__ = [
     "walk_forward",
     "evaluate",
+    "evaluate_totals",
     "calibration_table",
     "ats_record",
+    "ou_record",
+    "track_season",
     "BacktestResult",
+    "SeasonScorecard",
 ]
 
 
@@ -157,6 +163,81 @@ def ats_record(
     }
 
 
+def evaluate_totals(frame: pd.DataFrame, total_col: str = "pred_total") -> Dict[str, float]:
+    """Mean absolute error, RMSE and bias for a frame of total forecasts.
+
+    Totals are scored as a regression rather than a classification: the
+    useful question is how many points the forecast missed by, not whether
+    it landed on the right side of a line.
+    """
+    scored = frame[frame["actual_total"].notna() & frame[total_col].notna()]
+    if scored.empty:
+        return {"n": 0}
+
+    error = scored["actual_total"].to_numpy(dtype=float) - scored[total_col].to_numpy(
+        dtype=float
+    )
+    return {
+        "n": int(len(scored)),
+        "mae": float(np.mean(np.abs(error))),
+        "rmse": float(np.sqrt(np.mean(error**2))),
+        "bias": float(np.mean(error)),
+        "mean_total": float(np.mean(scored[total_col])),
+    }
+
+
+def ou_record(
+    frame: pd.DataFrame,
+    *,
+    total_col: str = "model_total",
+    threshold: float = 0.0,
+    odds: int = config.STANDARD_VIG_ODDS,
+) -> Dict[str, float]:
+    """Over/under record for picks whose disagreement with the line clears
+    ``threshold`` points.
+
+    The edge is measured against the model's *own* number rather than the
+    blended one, because the blend is mostly the line itself -- measuring
+    against it would report the line's disagreement with itself.
+    """
+    playable = frame[
+        frame["actual_total"].notna()
+        & frame["market_total"].notna()
+        & frame[total_col].notna()
+    ].copy()
+    if playable.empty:
+        return {"bets": 0, "threshold": threshold}
+
+    playable["edge"] = playable[total_col] - playable["market_total"]
+    playable = playable[playable["edge"].abs() >= threshold]
+    if playable.empty:
+        return {"bets": 0, "threshold": threshold}
+
+    took_over = playable["edge"] > 0
+    diff = playable["actual_total"] - playable["market_total"]
+    result = np.where(took_over, diff, -diff)
+
+    wins = int(np.sum(result > 0))
+    losses = int(np.sum(result < 0))
+    pushes = int(np.sum(result == 0))
+    decided = wins + losses
+
+    payout = 100.0 / abs(odds) if odds < 0 else odds / 100.0
+    profit = wins * payout - losses
+
+    return {
+        "bets": int(len(playable)),
+        "threshold": float(threshold),
+        "wins": wins,
+        "losses": losses,
+        "pushes": pushes,
+        "win_rate": float(wins / decided) if decided else float("nan"),
+        "roi": float(profit / decided) if decided else float("nan"),
+        "units": float(profit),
+        "breakeven": float(1.0 / (1.0 + payout)),
+    }
+
+
 # --------------------------------------------------------------------------
 # Walk-forward driver
 # --------------------------------------------------------------------------
@@ -169,6 +250,8 @@ class BacktestResult:
     calibration: pd.DataFrame
     by_season: pd.DataFrame
     ats: List[Dict[str, float]]
+    totals: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    ou: List[Dict[str, float]] = field(default_factory=list)
 
     def __repr__(self) -> str:  # pragma: no cover - display helper
         model = self.summary.get("model", {})
@@ -185,6 +268,8 @@ def walk_forward(
     end_season: int | None = None,
     use_market: bool = True,
     market_blend: float = config.DEFAULT_MARKET_BLEND,
+    total_blend: float = config.DEFAULT_TOTAL_MARKET_BLEND,
+    use_qb_features: bool = config.USE_QB_FEATURES_DEFAULT,
     refit: str = "week",
     min_train_games: int = 600,
     quiet: bool = False,
@@ -213,6 +298,7 @@ def walk_forward(
     slates = sorted(target["period"].unique())
     predictions: List[pd.DataFrame] = []
     predictor: GamePredictor | None = None
+    totals_predictor: TotalsPredictor | None = None
     fitted_for_season: int | None = None
     fits = 0
 
@@ -225,13 +311,19 @@ def walk_forward(
         need_refit = refit == "week" or fitted_for_season != season
         if need_refit or predictor is None:
             predictor = GamePredictor(
-                use_market=use_market, market_blend=market_blend
+                use_market=use_market,
+                market_blend=market_blend,
+                use_qb_features=use_qb_features,
+            ).fit(history)
+            totals_predictor = TotalsPredictor(
+                use_market=use_market, market_blend=total_blend
             ).fit(history)
             fitted_for_season = season
             fits += 1
 
         slate = frame[(frame["period"] == period) & frame["completed"]]
         preds = predictor.predict(slate)
+        total_preds = totals_predictor.predict(slate)
 
         carry = [
             "game_id", "season", "week", "home_team", "away_team", "margin",
@@ -242,7 +334,14 @@ def walk_forward(
             preds.drop(columns=["game_id"]).assign(game_id=preds["game_id"].values),
             on="game_id",
             how="left",
+        ).merge(
+            total_preds.drop(columns=["game_id"]).assign(
+                game_id=total_preds["game_id"].values
+            ),
+            on="game_id",
+            how="left",
         )
+        merged["actual_total"] = TotalsPredictor.actual_total(slate).to_numpy()
         merged["n_train"] = predictor.report.n_train
         predictions.append(merged)
 
@@ -306,10 +405,188 @@ def walk_forward(
         ats_record(scored, threshold=t) for t in (0.0, 0.5, 1.0, 1.5, 2.0, 3.0)
     ]
 
+    totals = {
+        "blended": evaluate_totals(scored, "pred_total"),
+        "model": evaluate_totals(scored, "model_total"),
+        "market": evaluate_totals(scored, "market_total"),
+    }
+    ou = [ou_record(scored, threshold=t) for t in (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)]
+
     return BacktestResult(
         predictions=scored,
         summary=summary,
         calibration=calibration_table(scored, "prob_home"),
         by_season=by_season,
         ats=ats,
+        totals=totals,
+        ou=ou,
     )
+
+
+# --------------------------------------------------------------------------
+# Live season tracking
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class SeasonScorecard:
+    """How the model has actually done so far this season."""
+
+    season: int
+    games: pd.DataFrame
+    by_week: pd.DataFrame
+    summary: Dict[str, float] = field(default_factory=dict)
+
+    def __repr__(self) -> str:  # pragma: no cover - display helper
+        return (
+            f"<SeasonScorecard {self.season} n={len(self.games)} "
+            f"acc={self.summary.get('accuracy', float('nan')):.3f}>"
+        )
+
+
+def track_season(
+    features: pd.DataFrame,
+    season: int,
+    *,
+    use_market: bool = True,
+    market_blend: float = config.DEFAULT_MARKET_BLEND,
+    total_blend: float = config.DEFAULT_TOTAL_MARKET_BLEND,
+    use_qb_features: bool = config.USE_QB_FEATURES_DEFAULT,
+    quiet: bool = True,
+) -> SeasonScorecard:
+    """Replay one season week by week and grade every pick that has settled.
+
+    This is deliberately not a slice of ``walk_forward``. The cutoff here is
+    each slate's first kickoff rather than its week number, matching exactly
+    what ``predict`` would have shown had it been run that morning -- so the
+    scorecard answers "how has it actually been doing", not "how would a
+    tidier version of it have done".
+
+    Nothing is cached between calls. The scorecard is recomputed from the
+    game log every time, so it cannot drift out of step with corrected
+    results the way a stored running tally would.
+    """
+    frame = features.copy()
+    target = frame[(frame["season"] == season) & frame["completed"]]
+    if target.empty:
+        return SeasonScorecard(season=season, games=pd.DataFrame(), by_week=pd.DataFrame())
+
+    rows: List[pd.DataFrame] = []
+    for week in sorted(target["week"].unique()):
+        slate = frame[(frame["season"] == season) & (frame["week"] == week)]
+        kickoff = slate["kickoff"].min()
+        completed = frame[frame["completed"]]
+        history = (
+            completed[completed["kickoff"] < kickoff]
+            if pd.notna(kickoff)
+            else completed[completed["season"] * 100 + completed["week"] < season * 100 + week]
+        )
+        if len(history) < 600:
+            continue
+
+        winner = GamePredictor(
+            use_market=use_market, market_blend=market_blend,
+            use_qb_features=use_qb_features,
+        ).fit(history)
+        totals = TotalsPredictor(
+            use_market=use_market, market_blend=total_blend
+        ).fit(history)
+
+        played = slate[slate["completed"]].copy()
+        if played.empty:
+            continue
+
+        predictions = winner.predict(played)
+        total_predictions = totals.predict(played)
+        played["prob_home"] = predictions["prob_home"].to_numpy()
+        played["pred_margin"] = predictions["pred_margin"].to_numpy()
+        played["model_total"] = total_predictions["model_total"].to_numpy()
+        played["pred_total"] = total_predictions["pred_total"].to_numpy()
+        played["market_total"] = total_predictions["market_total"].to_numpy()
+        played["actual_total"] = TotalsPredictor.actual_total(played).to_numpy()
+        played["n_train"] = winner.report.n_train
+        rows.append(played)
+
+        if not quiet:
+            print(f"  .. {season} wk {int(week):>2} ({len(played)} games)", file=sys.stderr)
+
+    if not rows:
+        return SeasonScorecard(season=season, games=pd.DataFrame(), by_week=pd.DataFrame())
+
+    games = pd.concat(rows, ignore_index=True)
+    games = _grade(games)
+
+    by_week = games.groupby("week", sort=True).agg(
+        games=("hit", "size"),
+        correct=("hit", "sum"),
+        accuracy=("hit", "mean"),
+        ats_wins=("ats_win", "sum"),
+        ats_played=("ats_win", "count"),
+        ou_wins=("ou_win", "sum"),
+        ou_played=("ou_win", "count"),
+        total_error=("total_error", "mean"),
+    ).reset_index()
+
+    summary = {
+        "games": int(len(games)),
+        "correct": float(games["hit"].sum()),
+        "accuracy": float(games["hit"].mean()),
+        "brier": float(np.mean((_clip(games["prob_home"]) - games["home_win"]) ** 2)),
+        "ats_wins": float(games["ats_win"].sum()),
+        "ats_played": int(games["ats_win"].count()),
+        "ou_wins": float(games["ou_win"].sum()),
+        "ou_played": int(games["ou_win"].count()),
+        "total_mae": float(games["total_error"].mean()),
+        "market_total_mae": float(
+            (games["actual_total"] - games["market_total"]).abs().mean()
+        ),
+    }
+    for key, wins, played in (
+        ("ats_rate", "ats_wins", "ats_played"),
+        ("ou_rate", "ou_wins", "ou_played"),
+    ):
+        summary[key] = (
+            summary[wins] / summary[played] if summary[played] else float("nan")
+        )
+
+    return SeasonScorecard(
+        season=season, games=games, by_week=by_week, summary=summary
+    )
+
+
+def _grade(games: pd.DataFrame) -> pd.DataFrame:
+    """Add per-game hit/miss columns for the winner, the spread and the total."""
+    games = games.copy()
+    outcome = games["home_win"].to_numpy(dtype=float)
+    prob = _clip(games["prob_home"])
+    games["pick"] = np.where(prob >= 0.5, games["home_team"], games["away_team"])
+    games["pick_prob"] = np.maximum(prob, 1.0 - prob)
+    games["hit"] = np.where(
+        outcome == config.TIE_CREDIT,
+        config.TIE_CREDIT,
+        np.where(prob > 0.5, outcome, 1.0 - outcome),
+    )
+
+    # Against the spread: pushes are dropped rather than counted as losses.
+    cover = games["margin"] - games["market_spread"]
+    took_home = (games["pred_margin"] - games["market_spread"]) > 0
+    result = np.where(took_home, cover, -cover)
+    games["ats_win"] = np.where(
+        games["market_spread"].isna() | (result == 0), np.nan, (result > 0).astype(float)
+    )
+
+    # Over/under, graded against the model's own number.
+    diff = games["actual_total"] - games["market_total"]
+    took_over = (games["model_total"] - games["market_total"]) > 0
+    ou_result = np.where(took_over, diff, -diff)
+    games["ou_win"] = np.where(
+        games["market_total"].isna() | (ou_result == 0),
+        np.nan,
+        (ou_result > 0).astype(float),
+    )
+    games["ou_pick"] = np.where(
+        games["market_total"].isna(), "-", np.where(took_over, "OVER", "UNDER")
+    )
+
+    games["total_error"] = (games["actual_total"] - games["pred_total"]).abs()
+    return games

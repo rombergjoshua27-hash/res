@@ -15,6 +15,8 @@ from . import config
 
 __all__ = [
     "american_to_decimal",
+    "prob_to_american",
+    "american_to_prob",
     "expected_value",
     "kelly_fraction",
     "attach_edges",
@@ -26,6 +28,29 @@ def american_to_decimal(odds: float) -> float:
     """Net payout per unit staked (``b`` in the Kelly formula)."""
     odds = float(odds)
     return odds / 100.0 if odds > 0 else 100.0 / abs(odds)
+
+
+def prob_to_american(prob: float) -> float:
+    """The moneyline that a win probability implies, with no vig attached.
+
+    This is the price at which a bet on that side would break even -- the
+    model's own moneyline, to be compared against the book's. A favourite
+    (prob > 0.5) returns a negative number, an underdog a positive one.
+    """
+    if pd.isna(prob):
+        return float("nan")
+    prob = float(np.clip(prob, 1e-6, 1 - 1e-6))
+    if prob >= 0.5:
+        return -100.0 * prob / (1.0 - prob)
+    return 100.0 * (1.0 - prob) / prob
+
+
+def american_to_prob(odds: float) -> float:
+    """Win probability implied by American odds, vig included."""
+    if pd.isna(odds):
+        return float("nan")
+    odds = float(odds)
+    return 100.0 / (odds + 100.0) if odds > 0 else (-odds) / (-odds + 100.0)
 
 
 def expected_value(prob: float, odds: float = config.STANDARD_VIG_ODDS) -> float:
@@ -84,6 +109,11 @@ def attach_edges(frame: pd.DataFrame) -> pd.DataFrame:
     else:
         out["spread_edge"] = np.nan
         out["ats_pick"] = "-"
+
+    # The model's own moneyline for each side: what the price *should* be if
+    # the model is right, quoted with no vig so it can be read against a book.
+    out["fair_home_ml"] = [prob_to_american(p) for p in prob_home]
+    out["fair_away_ml"] = [prob_to_american(1.0 - p) for p in prob_home]
 
     # Moneyline EV, using the price on the side the model actually likes.
     if {"home_moneyline", "away_moneyline"} <= set(out.columns):

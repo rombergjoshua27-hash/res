@@ -30,7 +30,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from . import config
-from .features import FEATURE_COLUMNS
+from .features import FEATURE_COLUMNS, QB_FEATURE_COLUMNS
 
 __all__ = ["GamePredictor", "spread_to_prob", "prob_to_spread", "devig_moneyline"]
 
@@ -94,14 +94,18 @@ class GamePredictor:
         use_market: bool = True,
         market_blend: float = config.DEFAULT_MARKET_BLEND,
         use_gbm: bool = True,
+        use_qb_features: bool = config.USE_QB_FEATURES_DEFAULT,
         seed: int = SEED,
     ) -> None:
         self.use_market = use_market
         self.market_blend = float(np.clip(market_blend, 0.0, 1.0))
         self.use_gbm = use_gbm
+        self.use_qb_features = use_qb_features
         self.seed = seed
 
         self.features: List[str] = list(FEATURE_COLUMNS)
+        if use_qb_features:
+            self.features += list(QB_FEATURE_COLUMNS)
         self._logistic: Pipeline | None = None
         self._margin: Pipeline | None = None
         self._gbm: HistGradientBoostingClassifier | None = None

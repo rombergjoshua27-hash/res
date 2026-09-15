@@ -2,6 +2,8 @@
 
     nflpredict predict                 # next unplayed slate
     nflpredict predict --week 5        # a specific week
+    nflpredict refresh                 # pull latest data, rebuild the workbook
+    nflpredict track                   # grade this season's picks so far
     nflpredict backtest                # prove the accuracy claim
     nflpredict ratings                 # current Elo power ratings
     nflpredict evaluate --season 2025  # score a finished season
@@ -19,12 +21,17 @@ from typing import Tuple
 import pandas as pd
 
 from . import config, report
-from .backtest import walk_forward
-from .data import load_games, load_team_game_epa
+from .backtest import track_season, walk_forward
+from .cache import cached_walk_forward
+from .data import load_games, load_half_scores, load_team_game_epa
+from .players import load_injuries, load_player_weeks
+from .props import PropsPredictor, build_props_frames
 from .edge import attach_edges
 from .elo import EloEngine
 from .features import build_features
 from .model import GamePredictor
+from .splits import SplitPredictor
+from .totals import TotalsPredictor
 
 __all__ = ["main"]
 
@@ -43,19 +50,47 @@ def _build(args) -> Tuple[pd.DataFrame, pd.DataFrame]:
         if args.no_epa
         else load_team_game_epa(seasons, quiet=args.quiet)
     )
+
+    player_weeks = injuries = pd.DataFrame()
+    if not args.no_players:
+        player_weeks = load_player_weeks(seasons, quiet=args.quiet)
+        injuries = load_injuries(seasons, quiet=args.quiet)
+
+    halves = pd.DataFrame() if args.no_epa else load_half_scores(seasons, quiet=args.quiet)
+
     engine = EloEngine(use_qb=args.qb_adjustment)
-    features = build_features(games, epa, elo_engine=engine)
+    features = build_features(
+        games, epa, elo_engine=engine,
+        player_weeks=player_weeks, injuries=injuries, half_scores=halves,
+    )
+    # Fitting on passer terms that are structurally zero would teach the model
+    # a coefficient it can never use, so the switch follows the data.
+    args._have_players = not player_weeks.empty
+    args._player_weeks = player_weeks
+    args._injuries = injuries
+    args._games = games
     return games, features
 
 
 def _target_slate(features: pd.DataFrame, args) -> Tuple[int, int]:
     """Resolve which (season, week) to predict.
 
-    Defaults to the earliest slate that still has an unplayed game -- i.e.
-    the games that actually need predicting.
+    Defaults to the earliest slate that still has an unplayed game, with one
+    refinement: a week whose games have mostly been played is not the
+    upcoming slate. On a Monday, week N has a single night game left and week
+    N+1 is what actually needs predicting, so the default rolls forward and
+    the finished results feed the fit instead. ``--week`` still reaches the
+    straggler.
     """
-    if args.season and args.week:
-        return int(args.season), int(args.week)
+    # A week on its own is a complete instruction -- there is only one season
+    # in progress. Requiring both flags silently ignored `--week 3`.
+    if args.week:
+        season = int(args.season) if args.season else int(features["season"].max())
+        return season, int(args.week)
+    if args.season and not args.week:
+        in_season = features[features["season"] == int(args.season)]
+        if in_season.empty:
+            raise SystemExit(f"no games on record for {args.season}")
 
     pending = features[~features["completed"]]
     if args.season:
@@ -66,23 +101,118 @@ def _target_slate(features: pd.DataFrame, args) -> Tuple[int, int]:
         return int(last["season"]), int(last["week"])
 
     first = pending.sort_values(["season", "week"]).iloc[0]
-    return int(first["season"]), int(first["week"])
+    season, week = int(first["season"]), int(first["week"])
+
+    slate = features[(features["season"] == season) & (features["week"] == week)]
+    if slate["completed"].mean() >= 0.5:
+        later = pending[
+            (pending["season"] > season)
+            | ((pending["season"] == season) & (pending["week"] > week))
+        ]
+        if not later.empty:
+            nxt = later.sort_values(["season", "week"]).iloc[0]
+            season, week = int(nxt["season"]), int(nxt["week"])
+    return season, week
 
 
-def _fit_through(features: pd.DataFrame, season: int, week: int, args) -> GamePredictor:
-    """Fit on every completed game strictly before the target slate."""
-    period = season * 100 + week
-    history = features[
-        (features["season"] * 100 + features["week"] < period) & features["completed"]
-    ]
+def _team_points(history: pd.DataFrame, slate: pd.DataFrame) -> pd.DataFrame:
+    """Projected points per team-game, the way the props model wants them.
+
+    A player's workload follows his offence, so the game model's own view of
+    how many points each side will score is the single most useful piece of
+    context a prop projection can have.
+    """
+    frames = []
+    for source in (history, slate):
+        if source.empty or "home_team_total" not in source.columns:
+            continue
+        for side, column in (("home_team", "home_team_total"), ("away_team", "away_team_total")):
+            frames.append(
+                pd.DataFrame(
+                    {
+                        "game_id": source["game_id"].to_numpy(),
+                        "team": source[side].to_numpy(),
+                        "proj_points": source[column].to_numpy(),
+                    }
+                )
+            )
+    if not frames:
+        return pd.DataFrame(columns=["game_id", "team", "proj_points"])
+    return pd.concat(frames, ignore_index=True).drop_duplicates(["game_id", "team"])
+
+
+def _project_props(features, slate, season, week, args, team_points):
+    """Fit the props model on history and project the upcoming slate."""
+    player_weeks = getattr(args, "_player_weeks", None)
+    if player_weeks is None or player_weeks.empty:
+        return pd.DataFrame()
+
+    history, rows = build_props_frames(
+        player_weeks,
+        getattr(args, "_games", None),
+        slate,
+        getattr(args, "_injuries", pd.DataFrame()),
+        team_points,
+    )
+    if history.empty or rows.empty or len(history) < 5000:
+        return pd.DataFrame()
+
+    try:
+        model = PropsPredictor().fit(history)
+    except ValueError:
+        return pd.DataFrame()
+
+    projections = model.predict(rows)
+    projections["availability"] = rows["availability"].to_numpy()
+    return projections
+
+
+def _qb_features_enabled(args) -> bool:
+    """Whether the passer and availability terms should be fitted at all."""
+    if args.no_qb_features:
+        return False
+    return bool(getattr(args, "_have_players", False))
+
+
+def _training_history(features: pd.DataFrame, season: int, week: int) -> pd.DataFrame:
+    """Every game that had finished before the target slate kicks off.
+
+    The cutoff is the slate's first kickoff rather than its week number, so a
+    midweek run picks up results already on the board -- predicting week 2 on
+    a Monday trains on week 1's Sunday games, which a week-number cutoff
+    would throw away. All games in the slate share one cutoff, so no game in
+    it is fitted on a different information set than its neighbours.
+    """
+    slate = features[(features["season"] == season) & (features["week"] == week)]
+    completed = features[features["completed"]]
+
+    kickoff = slate["kickoff"].min() if not slate.empty else pd.NaT
+    if pd.isna(kickoff):
+        period = season * 100 + week
+        return completed[completed["season"] * 100 + completed["week"] < period]
+    return completed[completed["kickoff"] < kickoff]
+
+
+def _fit_through(
+    features: pd.DataFrame, season: int, week: int, args
+) -> Tuple[GamePredictor, TotalsPredictor, pd.DataFrame]:
+    """Fit the winner/spread model and the totals model on the same history."""
+    history = _training_history(features, season, week)
     if len(history) < 200:
         raise SystemExit(
             f"only {len(history)} completed games before {season} week {week}; "
             "not enough history to fit"
         )
-    return GamePredictor(
-        use_market=not args.no_market, market_blend=args.market_blend
+    winner = GamePredictor(
+        use_market=not args.no_market,
+        market_blend=args.market_blend,
+        use_qb_features=_qb_features_enabled(args),
     ).fit(history)
+    totals = TotalsPredictor(
+        use_market=not args.no_market,
+        market_blend=getattr(args, "total_blend", config.DEFAULT_TOTAL_MARKET_BLEND),
+    ).fit(history)
+    return winner, totals, history
 
 
 # --------------------------------------------------------------------------
@@ -90,41 +220,122 @@ def _fit_through(features: pd.DataFrame, season: int, week: int, args) -> GamePr
 # --------------------------------------------------------------------------
 
 
-def cmd_predict(args) -> int:
-    _, features = _build(args)
-    season, week = _target_slate(features, args)
-    predictor = _fit_through(features, season, week, args)
+def _predict_slate(features: pd.DataFrame, season: int, week: int, args):
+    """Fit both models through the slate's kickoff and score every game in it.
+
+    Returns the enriched slate plus the two fitted predictors, so callers can
+    report what the fit actually saw.
+    """
+    winner, totals, history = _fit_through(features, season, week, args)
 
     slate = features[
         (features["season"] == season) & (features["week"] == week)
     ].copy()
     if slate.empty:
-        print(f"No games scheduled for {season} week {week}.", file=sys.stderr)
-        return 1
+        raise SystemExit(f"No games scheduled for {season} week {week}.")
 
-    predictions = predictor.predict(slate)
-    merged = slate.merge(
-        predictions.drop(columns=["game_id"]).assign(
+    def _attach(frame: pd.DataFrame, predictions: pd.DataFrame) -> pd.DataFrame:
+        """Merge predictions onto the slate, letting them win any name clash.
+
+        A predictor may re-emit a column the feature frame already carries
+        (``market_total`` is both an input and an output). Dropping the
+        feature-side copy first keeps one authoritative column instead of a
+        silently suffixed ``_x``/``_y`` pair.
+        """
+        payload = predictions.drop(columns=["game_id"]).assign(
             game_id=predictions["game_id"].values
-        ),
-        on="game_id",
-        how="left",
-    )
+        )
+        clashes = [
+            c for c in payload.columns if c != "game_id" and c in frame.columns
+        ]
+        return frame.drop(columns=clashes).merge(payload, on="game_id", how="left")
+
+    merged = _attach(slate, winner.predict(slate))
+    merged = _attach(merged, totals.predict(slate))
+    merged["actual_total"] = TotalsPredictor.actual_total(merged)
+
+    # Team totals and half lines are derived from the two full-game forecasts,
+    # so the calibration is fitted on how those forecasts landed historically.
+    calibration = history.copy()
+    calibration = _attach(calibration, winner.predict(calibration))
+    calibration = _attach(calibration, totals.predict(calibration))
+    splits = SplitPredictor().fit(calibration)
+    merged = _attach(merged, splits.predict(merged))
+
+    calibration = _attach(calibration, splits.predict(calibration))
+    team_points = _team_points(calibration, merged)
+
     enriched = attach_edges(merged).sort_values("pick_prob", ascending=False)
+    props = (
+        pd.DataFrame()
+        if args.no_props
+        else _project_props(features, slate, season, week, args, team_points)
+    )
+    scorecard = (
+        None
+        if args.no_scorecard
+        else track_season(
+            features, season,
+            use_market=not args.no_market,
+            market_blend=args.market_blend,
+            total_blend=args.total_blend,
+            use_qb_features=_qb_features_enabled(args),
+        )
+    )
+    return enriched, winner, totals, history, splits, props, scorecard
+
+
+def cmd_predict(args) -> int:
+    _, features = _build(args)
+    season, week = _target_slate(features, args)
+    enriched, predictor, totals, history, splits, props, scorecard = _predict_slate(
+        features, season, week, args
+    )
 
     priced = int(enriched["market_spread"].notna().sum())
     title = (
         f"{season} WEEK {week}  --  {len(enriched)} games  "
-        f"({priced} with a posted line, trained on {predictor.report.n_train:,} games)"
+        f"({priced} with a posted line, trained on {predictor.report.n_train:,} games"
+        f"{_history_note(history, season)})"
     )
     print(report.format_slate(enriched, title=title))
+    print()
+    print(report.format_totals(enriched, sigma=totals.report.sigma))
+    print()
+    print(report.format_splits(enriched))
+    if not props.empty:
+        print()
+        print(report.format_props(props))
+    if scorecard is not None and not scorecard.games.empty:
+        print()
+        print(report.format_scorecard(scorecard))
+
+    if not args.no_excel:
+        result, hit = cached_walk_forward(
+            features,
+            start_season=getattr(args, "start", None) or config.DEFAULT_BACKTEST_START,
+            use_market=not args.no_market,
+            market_blend=args.market_blend,
+            total_blend=args.total_blend,
+            use_qb_features=_qb_features_enabled(args),
+            refit="season",
+            quiet=args.quiet,
+        )
+        if not args.quiet and not hit:
+            print("\nBacktesting once so the workbook carries its own evidence ...")
+        print("\n" + _write_workbook(
+            enriched, season, week, args, predictor, totals, history,
+            props, scorecard, result,
+        ))
 
     if args.csv:
         columns = [
             "game_id", "season", "week", "away_team", "home_team", "pick",
             "pick_prob", "confidence", "prob_home", "model_prob_home",
             "market_prob_home", "pred_margin", "market_spread", "spread_edge",
-            "ats_pick", "ml_ev", "kelly",
+            "ats_pick", "fair_home_ml", "fair_away_ml", "ml_ev", "kelly",
+            "pred_total", "model_total", "market_total", "total_edge",
+            "prob_over", "ou_pick",
         ]
         config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         path = config.OUTPUT_DIR / f"predictions_{season}_wk{week:02d}.csv"
@@ -133,7 +344,139 @@ def cmd_predict(args) -> int:
     return 0
 
 
+def _team_table(games: pd.DataFrame, ratings: pd.DataFrame, *, window: int = 17) -> pd.DataFrame:
+    """Per-team reference figures for the workbook's Matchup Picker.
+
+    Scoring is a plain per-game average over each team's last ``window``
+    games, not opponent-adjusted. That is a real simplification against the
+    model's own features, and the sheet says so -- but it is what fits in a
+    spreadsheet formula, and a reader can check it by hand.
+    """
+    played = games[games["completed"]].sort_values(
+        ["season", "week", "kickoff"], kind="mergesort"
+    )
+    if played.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for team in sorted(set(played["home_team"]) | set(played["away_team"])):
+        theirs = played[
+            (played["home_team"] == team) | (played["away_team"] == team)
+        ].tail(window)
+        if theirs.empty:
+            continue
+        at_home = theirs["home_team"] == team
+        points_for = theirs["home_score"].where(at_home, theirs["away_score"])
+        points_against = theirs["away_score"].where(at_home, theirs["home_score"])
+        rows.append(
+            {
+                "team": team,
+                "games": int(len(theirs)),
+                "points_for": float(points_for.mean()),
+                "points_against": float(points_against.mean()),
+            }
+        )
+
+    table = pd.DataFrame(rows)
+    if ratings is not None and not ratings.empty:
+        table = table.merge(ratings, on="team", how="left")
+    return table
+
+
+def _write_workbook(
+    enriched, season: int, week: int, args, predictor, totals, history,
+    props=None, scorecard=None, result=None,
+) -> str:
+    """Write the one workbook and return a line saying where it went."""
+    from datetime import datetime
+
+    from .excel import export_workbook
+
+    games = load_games(quiet=True)
+    engine = EloEngine(use_qb=args.qb_adjustment)
+    engine.run(games)
+    ratings = engine.current_ratings()
+
+    meta = {
+        "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "slate_season": season,
+        "slate_week": week,
+        "slate_train": predictor.report.n_train,
+        "market_blend": args.market_blend,
+        "total_blend": args.total_blend,
+        "total_sigma": totals.report.sigma,
+        "slate_history_note": _history_note(history, season).lstrip(", "),
+        "team_window": 17,
+        "hfa_points": _current_hfa(games, season),
+    }
+    if result is not None:
+        meta["start"] = args.start if getattr(args, "start", None) else config.DEFAULT_BACKTEST_START
+        meta["end"] = int(result.predictions["season"].max())
+
+    path = Path(args.excel) if getattr(args, "excel", None) else (
+        config.OUTPUT_DIR / f"nflpredict_{season}_wk{week:02d}.xlsx"
+    )
+    export_workbook(
+        path,
+        slate=enriched,
+        ratings=ratings,
+        result=result,
+        meta=meta,
+        props=props,
+        scorecard=scorecard,
+        team_data=_team_table(games, ratings),
+    )
+    return (
+        f"Workbook written to {path}\n"
+        f"  {getattr(export_workbook, 'sheet_count', 0)} tabs | {len(enriched)} games "
+        f"| {len(ratings)} teams | "
+        f"{len(result.predictions):,} backtested games" if result is not None
+        else f"Workbook written to {path}"
+    )
+
+
+def _current_hfa(games: pd.DataFrame, season: int) -> float:
+    """Home-field advantage in points, as the Elo engine currently measures it."""
+    from .elo import estimate_hfa
+
+    try:
+        return float(estimate_hfa(games, season))
+    except Exception:  # noqa: BLE001 - fall back rather than fail the workbook
+        return float(config.HFA_POINTS_DEFAULT)
+
+
+def _history_note(history: pd.DataFrame, season: int) -> str:
+    """Note how much of the current season the fit already contains."""
+    if history.empty:
+        return ""
+    this_season = history[history["season"] == season]
+    if this_season.empty:
+        return ""
+    weeks = sorted(this_season["week"].unique())
+    span = f"wk {weeks[0]}" if len(weeks) == 1 else f"wks {weeks[0]}-{weeks[-1]}"
+    return f", incl. {len(this_season)} from {season} {span}"
+
+
+def _guard_warmup_season(args) -> None:
+    """Refuse to score the first season of loaded play-by-play.
+
+    That season's league baselines are centred on themselves, because there
+    is no earlier season to centre on (see ``features._league_baselines``).
+    It is a warm-up season, not a scoreable one, and the defaults already
+    leave a gap. Only a hand-picked ``--epa-start`` can close it.
+    """
+    if args.no_epa or args.start is None:
+        return
+    if args.start <= args.epa_start:
+        raise SystemExit(
+            f"--start {args.start} would score {args.epa_start}, the first season "
+            f"of play-by-play, whose league baselines are centred on themselves. "
+            f"Use --start {args.epa_start + 1} or later, or move --epa-start back."
+        )
+
+
 def cmd_backtest(args) -> int:
+    _guard_warmup_season(args)
     _, features = _build(args)
     result = walk_forward(
         features,
@@ -141,6 +484,8 @@ def cmd_backtest(args) -> int:
         end_season=args.end,
         use_market=not args.no_market,
         market_blend=args.market_blend,
+        total_blend=args.total_blend,
+        use_qb_features=_qb_features_enabled(args),
         refit=args.refit,
         quiet=args.quiet,
     )
@@ -175,6 +520,8 @@ def cmd_evaluate(args) -> int:
         end_season=season,
         use_market=not args.no_market,
         market_blend=args.market_blend,
+        total_blend=args.total_blend,
+        use_qb_features=_qb_features_enabled(args),
         refit=args.refit,
         quiet=args.quiet,
     )
@@ -183,29 +530,14 @@ def cmd_evaluate(args) -> int:
 
 
 def cmd_export(args) -> int:
-    """Write every model output to a multi-sheet Excel workbook."""
-    from datetime import datetime
-
-    from .excel import export_workbook
+    """Write the workbook with a freshly computed backtest."""
+    _guard_warmup_season(args)
 
     _, features = _build(args)
-
     season, week = _target_slate(features, args)
-    predictor = _fit_through(features, season, week, args)
-    slate = features[(features["season"] == season) & (features["week"] == week)].copy()
-    predictions = predictor.predict(slate)
-    merged = slate.merge(
-        predictions.drop(columns=["game_id"]).assign(
-            game_id=predictions["game_id"].values
-        ),
-        on="game_id",
-        how="left",
+    slate_out, predictor, totals, history, splits, props, scorecard = _predict_slate(
+        features, season, week, args
     )
-    slate_out = attach_edges(merged).sort_values("pick_prob", ascending=False)
-
-    engine = EloEngine(use_qb=args.qb_adjustment)
-    engine.run(load_games(quiet=args.quiet))
-    ratings = engine.current_ratings()
 
     if not args.quiet:
         print(f"Backtesting {args.start}-{args.end or 'latest'} for the workbook ...")
@@ -215,30 +547,127 @@ def cmd_export(args) -> int:
         end_season=args.end,
         use_market=not args.no_market,
         market_blend=args.market_blend,
+        total_blend=args.total_blend,
+        use_qb_features=_qb_features_enabled(args),
         refit=args.refit,
         quiet=args.quiet,
     )
 
-    meta = {
-        "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "start": args.start,
-        "end": args.end or int(result.predictions["season"].max()),
-        "slate_season": season,
-        "slate_week": week,
-        "slate_train": predictor.report.n_train,
-        "market_blend": args.market_blend,
-    }
-
-    path = Path(args.output) if args.output else (
-        config.OUTPUT_DIR / f"nflpredict_{season}_wk{week:02d}.xlsx"
-    )
-    export_workbook(path, slate=slate_out, ratings=ratings, result=result, meta=meta)
-    print(f"Workbook written to {path}")
-    print(
-        f"  8 sheets | {len(slate_out)} slate games | {len(ratings)} teams | "
-        f"{len(result.predictions):,} backtested games"
-    )
+    print(_write_workbook(
+        slate_out, season, week, args, predictor, totals, history,
+        props, scorecard, result,
+    ))
     return 0
+
+
+def cmd_track(args) -> int:
+    """Grade every pick this season has already settled."""
+    _, features = _build(args)
+    season = int(
+        args.season or features[features["completed"]]["season"].max()
+    )
+    card = track_season(
+        features,
+        season,
+        use_market=not args.no_market,
+        market_blend=args.market_blend,
+        total_blend=args.total_blend,
+        use_qb_features=_qb_features_enabled(args),
+        quiet=args.quiet,
+    )
+    print(report.format_scorecard(card))
+
+    if args.csv and not card.games.empty:
+        columns = [
+            "game_id", "season", "week", "away_team", "home_team", "pick",
+            "pick_prob", "margin", "hit", "market_spread", "pred_margin",
+            "ats_win", "market_total", "model_total", "pred_total",
+            "actual_total", "ou_pick", "ou_win", "total_error",
+        ]
+        config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        path = config.OUTPUT_DIR / f"scorecard_{season}.csv"
+        card.games[[c for c in columns if c in card.games.columns]].to_csv(
+            path, index=False
+        )
+        print(f"\nPer-game results written to {path}")
+    return 0
+
+
+def cmd_refresh(args) -> int:
+    """Pull the latest data and rebuild the workbook, in one command.
+
+    Only the current season is re-downloaded. Scores, closing lines, listed
+    quarterbacks and the injury report all move during a week; seasons that
+    have finished do not change, and re-fetching twenty of them daily would
+    be twenty minutes of downloading to discover nothing had happened.
+    """
+    from .data import _season_epa_path, _half_score_path
+
+    games = load_games(refresh=True, quiet=args.quiet)
+    season = int(games["season"].max())
+    if not args.quiet:
+        print(f"Refreshing {season} ...")
+
+    # Dropping the season's caches is what forces them to rebuild below.
+    for path in (_season_epa_path(season), _half_score_path(season)):
+        path.unlink(missing_ok=True)
+    for kind in ("stats_player", "injuries"):
+        stale = config.PLAYER_CACHE_DIR / (
+            f"{kind}_v{config.PLAYER_CACHE_VERSION}_{season}.csv"
+        )
+        stale.unlink(missing_ok=True)
+
+    completed_before = int(games["completed"].sum())
+    args.refresh = False  # the game log is already current
+    _, features = _build(args)
+
+    season, week = _target_slate(features, args)
+    slate_out, predictor, totals, history, splits, props, scorecard = _predict_slate(
+        features, season, week, args
+    )
+
+    result, hit = cached_walk_forward(
+        features,
+        start_season=getattr(args, "start", None) or config.DEFAULT_BACKTEST_START,
+        use_market=not args.no_market,
+        market_blend=args.market_blend,
+        total_blend=args.total_blend,
+        use_qb_features=_qb_features_enabled(args),
+        refit="season",
+        quiet=args.quiet,
+    )
+    if not args.quiet and not hit:
+        print("Results changed, so the backtest was rerun ...")
+
+    print(_write_workbook(
+        slate_out, season, week, args, predictor, totals, history,
+        props, scorecard, result,
+    ))
+    print(
+        f"  {completed_before:,} completed games on record | "
+        f"predicting {season} week {week}"
+    )
+    if args.prune_raw:
+        removed = _prune_raw_downloads()
+        if removed and not args.quiet:
+            print(f"  removed {removed} raw play-by-play file(s) to save space")
+    return 0
+
+
+def _prune_raw_downloads() -> int:
+    """Delete raw play-by-play, which is only ever an input to the caches.
+
+    Each file is ~18 MB and re-downloadable; the summaries distilled from
+    them are ~60 KB per season. Worth having behind a flag for anywhere the
+    cache is kept between runs, like a scheduled job.
+    """
+    raw = config.DATA_DIR / "pbp"
+    if not raw.exists():
+        return 0
+    files = list(raw.glob("*.csv.gz"))
+    for path in files:
+        path.unlink(missing_ok=True)
+    return len(files)
 
 
 def cmd_update(args) -> int:
@@ -281,6 +710,29 @@ def _common_options() -> argparse.ArgumentParser:
         ),
     )
     common.add_argument(
+        "--total-blend", type=float, default=config.DEFAULT_TOTAL_MARKET_BLEND,
+        help=(
+            "model weight when blending with the posted total "
+            f"(default: {config.DEFAULT_TOTAL_MARKET_BLEND})"
+        ),
+    )
+    common.add_argument(
+        "--no-scorecard", action="store_true",
+        help="skip this season's running results",
+    )
+    common.add_argument(
+        "--no-props", action="store_true",
+        help="skip player prop projections",
+    )
+    common.add_argument(
+        "--no-players", action="store_true",
+        help="skip player stats and injury reports entirely",
+    )
+    common.add_argument(
+        "--no-qb-features", action="store_true",
+        help="load player data but leave the passer/availability terms out of the fit",
+    )
+    common.add_argument(
         "--qb-adjustment", action="store_true",
         help="enable the Elo QB term (measurably worse; see config.py)",
     )
@@ -305,6 +757,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     predict.add_argument("--season", type=int, help="season (default: current)")
     predict.add_argument("--week", type=int, help="week (default: next unplayed)")
+    predict.add_argument(
+        "--no-excel", action="store_true",
+        help="skip the workbook and print to the terminal only",
+    )
+    predict.add_argument(
+        "--excel", metavar="PATH",
+        help="workbook path (default: out/slate_<season>_wk<week>.xlsx)",
+    )
     predict.set_defaults(func=cmd_predict)
 
     backtest = subparsers.add_parser(
@@ -338,6 +798,26 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--refit", choices=("week", "season"), default="season")
     export.add_argument("-o", "--output", help="output path (default: out/*.xlsx)")
     export.set_defaults(func=cmd_export)
+
+    track = subparsers.add_parser(
+        "track", parents=[common], help="grade this season's picks so far"
+    )
+    track.add_argument("--season", type=int, default=None)
+    track.set_defaults(func=cmd_track)
+
+    refresh = subparsers.add_parser(
+        "refresh", parents=[common],
+        help="pull the latest data and rebuild the workbook",
+    )
+    refresh.add_argument("--season", type=int, help="slate season (default: current)")
+    refresh.add_argument("--week", type=int, help="slate week (default: next unplayed)")
+    refresh.add_argument("--start", type=int, default=config.DEFAULT_BACKTEST_START)
+    refresh.add_argument("-o", "--output", dest="excel", help="workbook path")
+    refresh.add_argument(
+        "--prune-raw", action="store_true",
+        help="delete raw play-by-play afterwards (it is re-downloadable)",
+    )
+    refresh.set_defaults(func=cmd_refresh)
 
     update = subparsers.add_parser(
         "update", parents=[common], help="refresh cached data"

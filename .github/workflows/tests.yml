@@ -1,0 +1,71 @@
+name: Tests
+
+on:
+  # Pushes are limited to the default branch on purpose. An unrestricted
+  # `push:` fires alongside `pull_request:` for the same commit, so every
+  # push to a PR branch ran the whole matrix twice -- four check runs for two
+  # jobs. This way the base branch stays covered and a PR is tested once.
+  push:
+    branches: [claude/nfl-game-predictor-m4va67]
+  pull_request:
+
+# A second push while the first is still running only ever wastes a runner.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # The ends of the supported range. They are not the same test: 3.10
+        # resolves pandas 2.x and 3.13 resolves pandas 3.x, so the pair also
+        # covers the 2 -> 3 boundary.
+        python-version: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: pip install -e . pytest
+
+      # The suite runs against real nflverse data rather than synthetic
+      # frames, because the properties worth testing -- leakage, chronology,
+      # franchise continuity -- are properties of the real pipeline. Cold that
+      # costs a ~110 MB download; the distilled summaries are ~20 MB, so those
+      # are cached and the raw play-by-play they came from is not.
+      #
+      # Keyed on config.py so bumping a cache version invalidates it, which is
+      # exactly when a stale cache would otherwise be read back with columns
+      # silently missing.
+      - name: Restore data cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/epa
+            data/players
+            data/games.csv
+          key: nflpredict-test-data-${{ hashFiles('nflpredict/config.py') }}
+          restore-keys: |
+            nflpredict-test-data-
+
+      - name: Run tests
+        run: pytest -q --durations=10
+
+      # A smoke test that the entry point and argument wiring survive, not a
+      # second run of the model. --no-epa/--no-players keep it to the game log:
+      # without them this command loads every season of play-by-play and turns
+      # a two-second check into a twenty-minute download.
+      - name: Check the CLI is wired up
+        run: |
+          nflpredict --help > /dev/null
+          nflpredict ratings --top 5 --quiet --no-epa --no-players

@@ -11,16 +11,53 @@ import pandas as pd
 
 from . import config
 
-__all__ = ["format_slate", "format_backtest", "format_ratings", "HONESTY_NOTE"]
+__all__ = [
+    "format_slate", "format_totals", "format_splits", "format_props",
+    "format_scorecard",
+    "format_backtest",
+    "format_ratings", "HONESTY_NOTE", "TOTALS_NOTE", "SPLITS_NOTE",
+]
 
 HONESTY_NOTE = (
     "These are probabilities, not certainties. Walk-forward backtesting over\n"
-    "2008-2025 (4,897 games) puts this model at ~66.6% straight-up -- roughly\n"
-    "level with the closing line and ~1 game in 3 wrong. Against the spread it\n"
-    "wins 49.6% and loses money at standard -110 juice. No model predicts NFL\n"
-    "games without mistakes."
+    "2008-2026 (4,912 games) puts this model at 66.6% straight-up -- level with\n"
+    "the closing line and ~1 game in 3 wrong. Against the spread it wins 49.6%\n"
+    "and loses money at standard -110 juice. No model predicts NFL games\n"
+    "without mistakes."
 )
 
+TOTALS_NOTE = (
+    "Totals are harder than sides, not easier. Walk-forward over 2008-2026\n"
+    "(4,912 games) the model misses the final total by 10.68 points on average;\n"
+    "the closing total misses by 10.47. Blending the two lands at 10.46 -- a\n"
+    "tie, not an edge. Over/under picks hit 50.8%, under the 52.38% needed to\n"
+    "break even at -110."
+)
+
+SPLITS_NOTE = (
+    "Team totals and half lines are derived from the game total and the spread,\n"
+    "not modelled separately -- a team total is not free to disagree with them.\n"
+    "Walk-forward over 2008-2026 (4,912 games) the team totals miss by 7.5 and\n"
+    "7.3 points against 8.1 for guessing the league average, so they carry real\n"
+    "information. The first-half total misses by 7.03 against 7.22 for that same\n"
+    "naive guess -- barely any edge at all. First halves are mostly noise, and\n"
+    "the first-half side is picked correctly 60.7% of the time against 66.6% for the\n"
+    "full game."
+)
+
+PROPS_NOTE = (
+    "Props are the least certain thing here. Walk-forward over 2012-2026, for\n"
+    "players with real involvement, the projections miss by 62 passing yards,\n"
+    "24 rushing and 23 receiving. Against that player's own recent average\n"
+    "(68 / 26 / 25) that is a clear gain; against simply quoting the league\n"
+    "average for the position (64 / 27 / 26) it is a clear gain on the two\n"
+    "rushing and receiving numbers and a slim one on passing yards, where\n"
+    "starting quarterbacks cluster tightly enough that the average is hard to\n"
+    "beat. Either way a 60-yard miss on a passing projection is a wide miss.\n"
+    "Yardage is long-tailed, so no over/under probability is offered: a normal\n"
+    "curve would understate the outliers. The roster is whoever played\n"
+    "recently, so a player promoted this week is projected on last month's role."
+)
 _RULE = "-" * 78
 
 
@@ -86,6 +123,224 @@ def format_slate(frame: pd.DataFrame, *, title: str = "PREDICTIONS") -> str:
     return "\n".join(lines)
 
 
+def format_totals(frame: pd.DataFrame, *, sigma: float = config.TOTAL_SIGMA) -> str:
+    """Render the point-total forecast for one slate."""
+    if frame.empty or "pred_total" not in frame.columns:
+        return "No point-total forecast available for this slate."
+
+    ordered = frame.sort_values("pred_total", ascending=False)
+    lines = [_RULE, "POINT TOTALS", _RULE]
+    header = (
+        f"{'MATCHUP':<20}{'PICK':<7}{'MODEL':>7}{'LINE':>7}{'PROJ':>7}"
+        f"{'EDGE':>7}{'P(OVER)':>9}{'CONF':>10}"
+    )
+    lines += [header, "-" * len(header)]
+
+    any_settled = False
+    for row in ordered.itertuples(index=False):
+        matchup = f"{row.away_team} @ {row.home_team}"
+        line = getattr(row, "market_total", np.nan)
+        prob_over = getattr(row, "prob_over", np.nan)
+        pick = getattr(row, "ou_pick", "-")
+
+        # Quote confidence from the side the model actually took, so the
+        # number reads the same way the pick does.
+        confidence = (
+            np.nan if pd.isna(prob_over)
+            else (prob_over if pick == "OVER" else 1.0 - prob_over)
+        )
+
+        suffix = ""
+        actual = getattr(row, "actual_total", np.nan)
+        if not pd.isna(actual) and not pd.isna(line):
+            any_settled = True
+            if actual == line:
+                suffix = "   PUSH"
+            else:
+                went_over = actual > line
+                hit = (went_over and pick == "OVER") or (not went_over and pick == "UNDER")
+                suffix = f"   {'HIT' if hit else 'MISS'} ({actual:.0f})"
+
+        model_total = getattr(row, "model_total", np.nan)
+        lines.append(
+            f"{matchup:<20}{pick:<7}"
+            f"{'    -  ' if pd.isna(model_total) else f'{model_total:7.1f}'}"
+            f"{'    -  ' if pd.isna(line) else f'{line:7.1f}'}"
+            f"{'    -  ' if pd.isna(row.pred_total) else f'{row.pred_total:7.1f}'}"
+            f"{_fmt_signed(getattr(row, 'model_edge', np.nan), 6):>7}"
+            f"{_fmt_pct(prob_over, 7):>9}"
+            f"{_tier_label(confidence):>10}{suffix}"
+        )
+
+    lines.append(_RULE)
+    if any_settled:
+        lines.append("HIT/MISS marks games already played (still out-of-sample).")
+    lines += [
+        "MODEL is the model's own total, LINE the posted one, PROJ the blend of",
+        f"the two that is actually used (model weight "
+        f"{config.DEFAULT_TOTAL_MARKET_BLEND:.0%}). EDGE is MODEL minus LINE --",
+        "the size of the disagreement, most of which the blend deliberately",
+        f"discards. P(OVER) is taken from PROJ, using sigma={sigma:.1f} pts.",
+    ]
+    lines += ["", TOTALS_NOTE, _RULE]
+    return "\n".join(lines)
+
+
+def _tier_label(confidence: float) -> str:
+    """Confidence tier for an over/under probability quoted from the pick side."""
+    if pd.isna(confidence):
+        return "-"
+    for threshold, label in config.CONFIDENCE_TIERS:
+        if confidence >= threshold:
+            return label
+    return "COINFLIP"
+
+
+def format_splits(frame: pd.DataFrame) -> str:
+    """Render team totals and first-half lines for one slate."""
+    if frame.empty or "home_team_total" not in frame.columns:
+        return "No team totals available for this slate."
+
+    ordered = frame.sort_values("pred_total", ascending=False)
+    lines = [_RULE, "TEAM TOTALS AND FIRST HALF", _RULE]
+    header = (
+        f"{'MATCHUP':<20}{'AWAY':>7}{'HOME':>7}{'GAME':>8}"
+        f"{'1H TOT':>9}{'1H SPR':>9}{'2H TOT':>9}"
+    )
+    lines += [header, "-" * len(header)]
+
+    for row in ordered.itertuples(index=False):
+        matchup = f"{row.away_team} @ {row.home_team}"
+        lines.append(
+            f"{matchup:<20}"
+            f"{getattr(row, 'away_team_total', np.nan):>7.1f}"
+            f"{getattr(row, 'home_team_total', np.nan):>7.1f}"
+            f"{getattr(row, 'pred_total', np.nan):>8.1f}"
+            f"{getattr(row, 'first_half_total_pred', np.nan):>9.1f}"
+            f"{_fmt_signed(getattr(row, 'first_half_margin_pred', np.nan), 6):>9}"
+            f"{getattr(row, 'second_half_total_pred', np.nan):>9.1f}"
+        )
+
+    lines.append(_RULE)
+    lines += [
+        "AWAY/HOME are each side's projected points; they add to GAME by",
+        "construction. 1H SPR is the first-half spread from the home side.",
+        "", SPLITS_NOTE, _RULE,
+    ]
+    return "\n".join(lines)
+
+
+def format_props(props: pd.DataFrame, *, top: int = 12) -> str:
+    """Render the leading player projections for one slate."""
+    if props.empty:
+        return "No player projections available for this slate."
+
+    lines = [_RULE, "PLAYER PROJECTIONS", _RULE]
+    sections = (
+        ("proj_passing_yards", "PASSING YARDS"),
+        ("proj_rushing_yards", "RUSHING YARDS"),
+        ("proj_receiving_yards", "RECEIVING YARDS"),
+    )
+    for column, title in sections:
+        if column not in props.columns or props[column].isna().all():
+            continue
+        ranked = props.nlargest(top, column)
+        ranked = ranked[ranked[column] > 0]
+        if ranked.empty:
+            continue
+        lines += ["", title, "-" * 46]
+        lines.append(f"{'PLAYER':<26}{'TEAM':<6}{'POS':<5}{'PROJ':>7}")
+        for row in ranked.itertuples(index=False):
+            name = str(getattr(row, "player_display_name", ""))[:25]
+            flag = "" if getattr(row, "availability", 1.0) >= 0.999 else "  ?"
+            lines.append(
+                f"{name:<26}{str(getattr(row, 'team', '')):<6}"
+                f"{str(getattr(row, 'position', '')):<5}"
+                f"{getattr(row, column):>7.1f}{flag}"
+            )
+
+    lines += [_RULE, "? marks a player listed on the injury report; his projection is",
+              "scaled by how often that status actually plays.", "", PROPS_NOTE, _RULE]
+    return "\n".join(lines)
+
+
+def format_scorecard(card) -> str:
+    """Render how the model has actually done so far this season."""
+    if card.games.empty:
+        return f"No settled games yet for {card.season}."
+
+    summary = card.summary
+    lines = [
+        _RULE,
+        f"{card.season} SEASON SCORECARD  --  {summary['games']} games settled",
+        _RULE,
+        "Every week below was predicted using only games that had finished",
+        "before that slate kicked off -- the same call the tool would have made",
+        "on the morning of.",
+        "",
+    ]
+
+    header = (
+        f"{'WEEK':<6}{'GAMES':>7}{'RIGHT':>7}{'ACC':>8}"
+        f"{'ATS':>10}{'O/U':>10}{'TOT ERR':>9}"
+    )
+    lines += [header, "-" * len(header)]
+    for row in card.by_week.itertuples(index=False):
+        ats = (
+            "    -  " if not row.ats_played
+            else f"{int(row.ats_wins)}-{int(row.ats_played - row.ats_wins)}"
+        )
+        ou = (
+            "    -  " if not row.ou_played
+            else f"{int(row.ou_wins)}-{int(row.ou_played - row.ou_wins)}"
+        )
+        lines.append(
+            f"{int(row.week):<6}{int(row.games):>7}{row.correct:>7.0f}"
+            f"{_fmt_pct(row.accuracy, 7)}{ats:>10}{ou:>10}{row.total_error:>9.1f}"
+        )
+
+    lines += ["-" * len(header)]
+    ats_all = (
+        "    -  " if not summary["ats_played"]
+        else f"{int(summary['ats_wins'])}-"
+             f"{int(summary['ats_played'] - summary['ats_wins'])}"
+    )
+    ou_all = (
+        "    -  " if not summary["ou_played"]
+        else f"{int(summary['ou_wins'])}-"
+             f"{int(summary['ou_played'] - summary['ou_wins'])}"
+    )
+    lines.append(
+        f"{'ALL':<6}{summary['games']:>7}{summary['correct']:>7.0f}"
+        f"{_fmt_pct(summary['accuracy'], 7)}{ats_all:>10}{ou_all:>10}"
+        f"{summary['total_mae']:>9.1f}"
+    )
+
+    lines += [
+        "",
+        f"Brier {summary['brier']:.4f}   "
+        f"ATS {_fmt_pct(summary['ats_rate'], 5).strip()}   "
+        f"O/U {_fmt_pct(summary['ou_rate'], 5).strip()}   "
+        f"total error {summary['total_mae']:.2f} pts "
+        f"(closing total: {summary['market_total_mae']:.2f})",
+    ]
+
+    if summary["games"] < 100:
+        lines += [
+            "",
+            f"{summary['games']} games is far too few to judge a model on. The "
+            "long-run figures",
+            "are 66.6% straight up and 49.6% against the spread over 4,912 games; a "
+            "single",
+            "season swings several points either side of that on noise alone. A hot "
+            "start",
+            "is not evidence the model improved, and a cold one is not evidence it "
+            "broke.",
+        ]
+    lines.append(_RULE)
+    return "\n".join(lines)
+
+
 def format_backtest(result, *, label: str = "WALK-FORWARD BACKTEST") -> str:
     """Render the full honesty report for a backtest run."""
     lines = [_RULE, label, _RULE]
@@ -141,6 +396,42 @@ def format_backtest(result, *, label: str = "WALK-FORWARD BACKTEST") -> str:
             "Small-sample buckets (a few dozen bets) are noise, not an edge."
         )
 
+    totals = getattr(result, "totals", {}) or {}
+    if totals.get("model", {}).get("n"):
+        lines += ["", "POINT TOTALS (how many points the forecast missed by)", "-" * 61]
+        lines.append(f"{'METHOD':<26}{'GAMES':>7}{'MAE':>9}{'RMSE':>9}{'BIAS':>10}")
+        for key, name in [
+            ("blended", "Model + market blend"),
+            ("model", "Model alone (no market)"),
+            ("market", "Market (closing total)"),
+        ]:
+            entry = totals.get(key, {})
+            if not entry.get("n"):
+                continue
+            lines.append(
+                f"{name:<26}{entry['n']:>7,}{entry['mae']:>9.3f}"
+                f"{entry['rmse']:>9.3f}{entry['bias']:>+10.3f}"
+            )
+
+    playable_ou = [o for o in (getattr(result, "ou", []) or []) if o.get("bets")]
+    if playable_ou:
+        breakeven = playable_ou[0].get("breakeven", 0.5238)
+        lines += [
+            "",
+            f"OVER/UNDER (-110 juice, breakeven {breakeven * 100:.2f}%)",
+            "-" * 61,
+        ]
+        lines.append(f"{'MIN EDGE':<12}{'BETS':>7}{'W-L-P':>14}{'WIN%':>9}{'ROI':>9}")
+        for entry in playable_ou:
+            record = f"{entry['wins']}-{entry['losses']}-{entry['pushes']}"
+            lines.append(
+                f"{entry['threshold']:>5.1f} pts   {entry['bets']:>7,}{record:>14}"
+                f"{_fmt_pct(entry['win_rate'], 8)}{entry['roi'] * 100:>+8.2f}%"
+            )
+        lines.append(
+            "Edge is measured against the model's own total, not the blend."
+        )
+
     if not result.by_season.empty:
         lines += ["", "BY SEASON", "-" * 61]
         chunk = []
@@ -149,7 +440,7 @@ def format_backtest(result, *, label: str = "WALK-FORWARD BACKTEST") -> str:
         for i in range(0, len(chunk), 6):
             lines.append("  " + "   ".join(chunk[i : i + 6]))
 
-    lines += ["", HONESTY_NOTE, _RULE]
+    lines += ["", HONESTY_NOTE, "", TOTALS_NOTE, _RULE]
     return "\n".join(lines)
 
 

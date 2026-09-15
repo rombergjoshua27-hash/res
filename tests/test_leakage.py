@@ -49,7 +49,7 @@ def test_features_do_not_change_when_future_is_erased(games, team_epa):
     left = past.set_index("game_id").sort_index()
     right = redacted_past.set_index("game_id").sort_index()
 
-    for column in feat.FEATURE_COLUMNS:
+    for column in feat.FEATURE_COLUMNS + feat.TOTAL_FEATURE_COLUMNS:
         np.testing.assert_allclose(
             left[column].to_numpy(dtype=float),
             right[column].to_numpy(dtype=float),
@@ -72,7 +72,7 @@ def test_cutoff_week_features_are_unaffected_by_its_own_results(games, team_epa)
     left = full[full["game_id"].isin(ids)].set_index("game_id").sort_index()
     right = redacted[redacted["game_id"].isin(ids)].set_index("game_id").sort_index()
 
-    for column in feat.FEATURE_COLUMNS:
+    for column in feat.FEATURE_COLUMNS + feat.TOTAL_FEATURE_COLUMNS:
         np.testing.assert_allclose(
             left[column].to_numpy(dtype=float),
             right[column].to_numpy(dtype=float),
@@ -111,3 +111,94 @@ def test_form_features_are_zero_before_any_games_are_played(games, team_epa):
     opener = full[(full["season"] == first_season) & (full["week"] == 1)]
     assert len(opener) > 0
     assert (opener["form_confidence"] == 0).all()
+
+
+def test_scoring_form_does_not_contain_the_game_being_predicted(games, team_epa):
+    """The sharpest leak risk: ``points_for`` comes from a game's own score.
+
+    A blowout must move the *next* game's scoring feature, never its own. The
+    check is direct -- rebuild with that one game's score erased and require
+    its own feature value to be unchanged while the team's next game moves.
+    """
+    full = feat.build_features(games, team_epa)
+    played = full[full["completed"]].sort_values(["season", "week", "kickoff"])
+
+    # Skip the first loaded season: its league baseline is centred on itself
+    # for want of an earlier one, which is a separate, documented property
+    # (see ``_league_baselines``) and is pinned by its own test below.
+    scoreable = played[played["season"] > int(played["season"].min())]
+    # Pick a genuinely high-scoring game so the downstream effect is visible.
+    target = scoreable.loc[
+        (scoreable["home_score"] + scoreable["away_score"]).idxmax()
+    ]
+    team = target["home_team"]
+
+    later = played[
+        ((played["home_team"] == team) | (played["away_team"] == team))
+        & (played["kickoff"] > target["kickoff"])
+    ]
+    assert len(later) > 0, "need a subsequent game to observe the update"
+    next_game = later.iloc[0]
+
+    erased = games.copy()
+    mask = erased["game_id"] == target["game_id"]
+    for column in ("home_score", "away_score", "result", "margin", "home_win", "total"):
+        if column in erased.columns:
+            erased.loc[mask, column] = np.nan
+    erased.loc[mask, "completed"] = False
+    rebuilt = feat.build_features(erased, team_epa[team_epa["game_id"] != target["game_id"]])
+
+    def value(frame, game_id):
+        return float(frame.loc[frame["game_id"] == game_id, "scoring_sum"].iloc[0])
+
+    # Its own feature is untouched: the score never fed the game it came from.
+    assert value(rebuilt, target["game_id"]) == pytest.approx(
+        value(full, target["game_id"]), abs=1e-9
+    )
+    # The next game's feature does move, proving the score is used at all.
+    assert value(rebuilt, next_game["game_id"]) != pytest.approx(
+        value(full, next_game["game_id"]), abs=1e-6
+    )
+
+
+def test_the_market_never_enters_either_feature_matrix(games, team_epa):
+    """Lines are blended in afterwards, so no market column may be a feature."""
+    market_columns = {
+        "market_spread", "market_total", "spread_line", "total_line",
+        "home_moneyline", "away_moneyline", "over_odds", "under_odds",
+    }
+    modelled = set(feat.FEATURE_COLUMNS) | set(feat.TOTAL_FEATURE_COLUMNS)
+    assert modelled.isdisjoint(market_columns)
+
+
+def test_the_self_centred_baseline_is_confined_to_the_first_season(games, team_epa):
+    """Bound the one documented exception rather than leaving it implicit.
+
+    The first loaded season centres on its own mean because nothing earlier
+    exists. Every season after it must be untouched by its own games -- which
+    is what makes that first season a warm-up season rather than a leak in
+    the scored range.
+    """
+    full = feat.build_features(games, team_epa)
+    played = full[full["completed"]]
+    first_season = int(played["season"].min())
+
+    later = played[played["season"] > first_season]
+    target = later.loc[(later["home_score"] + later["away_score"]).idxmax()]
+
+    erased = games.copy()
+    mask = erased["game_id"] == target["game_id"]
+    for column in ("home_score", "away_score", "result", "margin", "home_win", "total"):
+        if column in erased.columns:
+            erased.loc[mask, column] = np.nan
+    erased.loc[mask, "completed"] = False
+    rebuilt = feat.build_features(
+        erased, team_epa[team_epa["game_id"] != target["game_id"]]
+    )
+
+    left = full[full["game_id"] == target["game_id"]]
+    right = rebuilt[rebuilt["game_id"] == target["game_id"]]
+    for column in feat.FEATURE_COLUMNS + feat.TOTAL_FEATURE_COLUMNS:
+        assert float(right[column].iloc[0]) == pytest.approx(
+            float(left[column].iloc[0]), abs=1e-9
+        ), f"{column!r} in season {int(target['season'])} saw its own result"

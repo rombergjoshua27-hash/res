@@ -30,7 +30,10 @@ import requests
 
 from . import config
 
-__all__ = ["load_games", "load_team_game_epa", "normalize_team", "refresh_all"]
+__all__ = [
+    "load_games", "load_team_game_epa", "load_half_scores",
+    "normalize_team", "refresh_all",
+]
 
 
 # --------------------------------------------------------------------------
@@ -180,12 +183,12 @@ def _win_value(margin: float) -> float:
 _PBP_COLUMNS = [
     "game_id", "season", "week", "posteam", "defteam", "epa", "success",
     "pass", "rush", "play_type", "qb_epa", "yards_gained", "interception",
-    "fumble_lost", "sack",
+    "fumble_lost", "sack", "drive",
 ]
 
 
 def _season_epa_path(season: int) -> Path:
-    return config.EPA_CACHE_DIR / f"team_game_epa_{season}.csv"
+    return config.EPA_CACHE_DIR / f"team_game_epa_v{config.EPA_CACHE_VERSION}_{season}.csv"
 
 
 def _aggregate_season_pbp(season: int, *, refresh: bool = False) -> pd.DataFrame:
@@ -259,15 +262,22 @@ def _aggregate_season_pbp(season: int, *, refresh: bool = False) -> pd.DataFrame
 _OFFENSE_STATS = [
     "off_epa_play", "off_pass_epa", "off_rush_epa", "off_success",
     "off_explosive", "off_turnover_rate", "off_sack_rate", "off_pass_rate",
+    "off_plays", "off_drives", "off_plays_per_drive",
 ]
 
 
 def _summarise_offense(frame: pd.DataFrame) -> pd.Series:
     is_pass = frame["pass"] > 0
     is_rush = frame["rush"] > 0
+    plays = float(len(frame))
+    # Drive count drives the totals model: points scored is roughly
+    # (drives) x (points per drive), so possessions are half the equation.
+    drives = float(frame["drive"].nunique()) if "drive" in frame.columns else float("nan")
     return pd.Series(
         {
-            "off_plays": float(len(frame)),
+            "off_plays": plays,
+            "off_drives": drives,
+            "off_plays_per_drive": plays / drives if drives and drives > 0 else float("nan"),
             "off_epa_play": frame["epa"].mean(),
             "off_pass_epa": frame.loc[is_pass, "epa"].mean(),
             "off_rush_epa": frame.loc[is_rush, "epa"].mean(),
@@ -324,3 +334,90 @@ def refresh_all(seasons: Sequence[int] | None = None) -> None:
     load_games(refresh=True)
     if seasons:
         load_team_game_epa(seasons, refresh=True)
+
+
+# --------------------------------------------------------------------------
+# Halftime scores
+# --------------------------------------------------------------------------
+
+_HALF_COLUMNS = ["game_id", "qtr", "total_home_score", "total_away_score"]
+
+
+def _half_score_path(season: int) -> Path:
+    return config.EPA_CACHE_DIR / f"half_scores_v{config.EPA_CACHE_VERSION}_{season}.csv"
+
+
+def _aggregate_season_halves(season: int, *, refresh: bool = False) -> pd.DataFrame:
+    """Reduce one season of play-by-play to the score at halftime."""
+    cache = _half_score_path(season)
+    if cache.exists() and not refresh:
+        return pd.read_csv(cache)
+
+    raw_path = config.DATA_DIR / "pbp" / f"play_by_play_{season}.csv.gz"
+    if refresh or not raw_path.exists():
+        _download(
+            config.PBP_URL_TEMPLATE.format(season=season),
+            raw_path,
+            label=f"pbp {season}",
+        )
+
+    plays = pd.read_csv(
+        raw_path, compression="gzip", low_memory=False,
+        usecols=lambda c: c in _HALF_COLUMNS,
+    )
+    # The running score columns are cumulative, so the largest value seen
+    # during the first two quarters is the score the teams took to the break.
+    first_half = plays[pd.to_numeric(plays["qtr"], errors="coerce") <= 2]
+    grouped = first_half.groupby("game_id").agg(
+        home_first_half=("total_home_score", "max"),
+        away_first_half=("total_away_score", "max"),
+    ).reset_index()
+    grouped["season"] = season
+
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    grouped.to_csv(cache, index=False)
+    return grouped
+
+
+def load_half_scores(
+    seasons: Iterable[int],
+    *,
+    refresh: bool = False,
+    quiet: bool = False,
+    max_workers: int = 4,
+) -> pd.DataFrame:
+    """Return the halftime score of every game in ``seasons``.
+
+    Columns: ``game_id``, ``season``, ``home_first_half``, ``away_first_half``.
+    Distilled from play-by-play and cached per season, like the EPA summaries.
+    """
+    seasons = sorted({int(s) for s in seasons if int(s) >= config.FIRST_PBP_SEASON})
+    if not seasons:
+        return pd.DataFrame(
+            columns=["game_id", "season", "home_first_half", "away_first_half"]
+        )
+
+    missing = [s for s in seasons if refresh or not _half_score_path(s).exists()]
+    if missing and not quiet:
+        print(
+            f"Building halftime-score cache for {len(missing)} season(s): "
+            f"{missing[0]}-{missing[-1]} ..."
+        )
+
+    if missing:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [
+                pool.submit(_aggregate_season_halves, season, refresh=refresh)
+                for season in missing
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                future.result()  # surface any download/parse error
+
+    frames = [
+        pd.read_csv(_half_score_path(s)) for s in seasons if _half_score_path(s).exists()
+    ]
+    if not frames:
+        return pd.DataFrame(
+            columns=["game_id", "season", "home_first_half", "away_first_half"]
+        )
+    return pd.concat(frames, ignore_index=True)

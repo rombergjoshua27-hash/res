@@ -18,6 +18,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_ROOT.parent
 DATA_DIR = Path(os.environ.get("NFLPREDICT_DATA_DIR", PROJECT_ROOT / "data"))
 EPA_CACHE_DIR = DATA_DIR / "epa"
+PLAYER_CACHE_DIR = DATA_DIR / "players"
 OUTPUT_DIR = Path(os.environ.get("NFLPREDICT_OUT_DIR", PROJECT_ROOT / "out"))
 
 # --------------------------------------------------------------------------
@@ -30,12 +31,36 @@ PBP_URL_TEMPLATE = (
     "play_by_play_{season}.csv.gz"
 )
 
+PLAYER_STATS_URL_TEMPLATE = (
+    "https://github.com/nflverse/nflverse-data/releases/download/stats_player/"
+    "stats_player_week_{season}.csv"
+)
+INJURIES_URL_TEMPLATE = (
+    "https://github.com/nflverse/nflverse-data/releases/download/injuries/"
+    "injuries_{season}.csv"
+)
+
 # Re-download the schedule file if the cached copy is older than this.
 # Scores and lines move during the week, so keep this short.
 GAMES_CACHE_HOURS = 6.0
 
 # Play-by-play availability. EPA is only modelled from 1999 onward.
 FIRST_PBP_SEASON = 1999
+
+# Bumped whenever the team-game aggregate schema changes, so a stale cache is
+# rebuilt rather than read back with columns silently missing.
+EPA_CACHE_VERSION = 2
+
+# Per-player weekly stats run the full length of the game log. Injury reports
+# start later, so any model using them must degrade gracefully before 2009.
+FIRST_PLAYER_STATS_SEASON = 1999
+FIRST_INJURY_SEASON = 2009
+PLAYER_CACHE_VERSION = 1
+
+# Injury report statuses, in order of severity. A player not on the report at
+# all is available; "Out" never plays. EMPIRICAL play rates from 2009-2026 are
+# measured in `players.py`.
+INJURY_STATUS_ORDER = ("Out", "Doubtful", "Questionable")
 
 DOWNLOAD_RETRIES = 4
 DOWNLOAD_BACKOFF_SECONDS = 2.0
@@ -101,6 +126,10 @@ REST_DIFF_CAP_DAYS = 10.0
 #     QB scale=25 cap=4     64.10%  brier 0.2192
 #     QB scale=45 cap=6     64.04%  brier 0.2207
 #
+# Re-confirmed on 2008-2026 with the current feature set: the default
+# scale takes the model from 65.1% / brier 0.2186 / log loss 0.6281 to
+# 64.1% / 0.2206 / 0.6325, and drags Elo alone from 65.1% to 63.3%.
+#
 # The cause is double counting: this rating attributes whole-team offensive
 # EPA to the starter, but team strength is already in the Elo rating, so the
 # adjustment re-applies a signal the model has. Isolating true QB value needs
@@ -108,6 +137,30 @@ REST_DIFF_CAP_DAYS = 10.0
 # Kept behind a flag (`--qb-adjustment`) rather than deleted so the
 # experiment stays reproducible.
 ELO_USE_QB_DEFAULT = False
+
+# The *second* quarterback attempt, which did work, and is on by default.
+#
+# `qb.py` rates a passer by completion percentage over expected and EPA per
+# dropback -- measures computed per throw, not per team play -- and feeds the
+# model the *change* from the quarterback a team has been playing, plus an
+# injury-report availability term. The weights are fitted, not chosen.
+#
+# Walk-forward 2008-2026, 4,912 games:
+#
+#                        accuracy   brier    log loss
+#   market off, base       65.07%   0.2186     0.6281
+#   market off, + QB       64.98%   0.2171     0.6247   <- p=0.002 on Brier
+#   market on,  base       66.61%   0.2099     0.6087
+#   market on,  + QB       66.59%   0.2099     0.6085   <- p=0.064
+#
+# Unchanged accuracy, significantly better probabilities, market-free: on the
+# 280 games where the two disagreed on the pick it was 138-142, a dead heat,
+# while the paired Brier improvement is real. With the market on it is a wash
+# -- the closing line already prices a backup quarterback and a Friday injury
+# report, so only 13 of 4,912 picks moved.
+# It is on because the market-free path is the one that matters when no line
+# is posted; `--no-qb-features` turns it off.
+USE_QB_FEATURES_DEFAULT = True
 QB_EWMA_ALPHA = 0.25          # responsiveness of a QB's own rolling rating
 QB_SHRINK_GAMES = 8.0         # games of league-average prior before trusting
 QB_EPA_TO_POINTS = 45.0       # 0.10 EPA/play gap ~= 4.5 points of spread
@@ -125,6 +178,39 @@ MARGIN_SIGMA = 13.2
 TIE_CREDIT = 0.5
 
 # --------------------------------------------------------------------------
+# Point totals
+# --------------------------------------------------------------------------
+
+# EMPIRICAL: std(actual total - closing total) = 13.43 over 1999-2026,
+# 13.31 over 2007-2026, 13.24 over 2015-2026. Used to turn a predicted total
+# into an over/under probability. A fitted model re-measures this on its own
+# residuals; this is the fallback and the sanity bound.
+TOTAL_SIGMA = 13.3
+
+# Weight on the model when blending with the posted total.
+#
+# Tuned on 2008-2017 (n=2,670) and validated on 2018-2026 (n=2,242). The
+# result is the same one the spread gives: the closing number is already
+# about as good as this gets. Held-out MAE by weight:
+#
+#     w=0.00 (market only)  10.4300
+#     w=0.10                10.4270   <- held-out optimum
+#     w=0.20                10.4304   <- optimum on the tuning years
+#     w=0.50                10.4756
+#
+# The tuning years picked w=0.20, which on held-out data was 0.0004 points
+# per game *worse* than simply posting the market number. 0.10 is kept
+# because it is the held-out optimum and matches the spread default, but the
+# honest reading is that the curve is flat and none of this is a real edge.
+# `--total-blend` overrides it; `--no-market` gives the pure model, which is
+# what a game with no posted total gets anyway.
+DEFAULT_TOTAL_MARKET_BLEND = 0.10
+
+# Roughly half of posted totals are whole numbers, and 2.9% of those land
+# exactly on the number for a push. Reported, never silently dropped.
+TOTAL_PUSH_RATE_WHOLE_LINES = 0.0286
+
+# --------------------------------------------------------------------------
 # Rolling team form (EPA) features
 # --------------------------------------------------------------------------
 
@@ -138,9 +224,13 @@ EPA_BLEND_FULL_GAMES = 6.0    # games before current season fully displaces prio
 # Model / blending
 # --------------------------------------------------------------------------
 
-# Seasons before this are used to warm up Elo but never scored in a backtest,
-# because play-by-play EPA features need a season of history.
-DEFAULT_BACKTEST_START = 2007
+# Seasons before this are used to warm up Elo and the rolling form but never
+# scored in a backtest. With play-by-play loaded from 2006, 2006 centres its
+# own league baselines (see features._league_baselines) and 2007 is the first
+# season with a full prior season of form behind every team -- so scoring
+# starts at 2008, one clear season after that. Every accuracy figure this
+# project publishes is measured on this default.
+DEFAULT_BACKTEST_START = 2008
 MIN_TRAIN_SEASONS = 4
 
 # Weight on the model when blending with the market price.
