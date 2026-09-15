@@ -846,6 +846,68 @@ def _build_team_totals(sheet, rec: Recorder, slate: pd.DataFrame, meta: dict) ->
     sheet.freeze_panes = f"A{first}"
 
 
+PROP_SECTIONS = (
+    ("proj_passing_yards", "Passing yards"),
+    ("proj_rushing_yards", "Rushing yards"),
+    ("proj_receiving_yards", "Receiving yards"),
+)
+
+
+def _build_props(sheet, props: pd.DataFrame, meta: dict, *, top: int = 30) -> None:
+    """Player yardage projections for the slate, one block per category."""
+    row = _write_title(
+        sheet,
+        f"{meta['slate_season']} Week {meta['slate_week']} Player Projections",
+        "Projected yards for the players expected to appear. Sorted within "
+        "each category; a question mark marks an injury-report listing.",
+    )
+
+    if props is None or props.empty:
+        _note(sheet, row, "No player projections available for this slate.")
+        _set_widths(sheet, [26, 8, 7, 10, 12])
+        return
+
+    for column, title in PROP_SECTIONS:
+        if column not in props.columns or props[column].isna().all():
+            continue
+        ranked = props.nlargest(top, column)
+        ranked = ranked[ranked[column] > 0]
+        if ranked.empty:
+            continue
+
+        sheet.cell(row=row, column=1, value=title).font = _SECTION_FONT
+        row += 1
+        _write_header(sheet, row, ["Player", "Team", "Pos", "Projection", "Status"])
+        row += 1
+        for game in ranked.itertuples(index=False):
+            availability = float(getattr(game, "availability", 1.0) or 1.0)
+            _value(sheet, row, 1, str(getattr(game, "player_display_name", "")))
+            _value(sheet, row, 2, str(getattr(game, "team", "")))
+            _value(sheet, row, 3, str(getattr(game, "position", "")))
+            _value(sheet, row, 4, _num(getattr(game, column)), "0.0")
+            _value(
+                sheet, row, 5,
+                "available" if availability >= 0.999 else f"listed ({availability:.0%})",
+            )
+            row += 1
+        row += 1
+
+    _note(sheet, row,
+          "Walk-forward 2012-2026, players with real involvement: projections miss "
+          "by 62 passing yards, 24 rushing and 23 receiving. That player's own "
+          "recent average misses by 68 / 26 / 25, and quoting the league average "
+          "for the position misses by 64 / 27 / 26 -- so the gain is clear on "
+          "rushing and receiving and slim on passing yards, where starting "
+          "quarterbacks cluster tightly. A 60-yard miss is still a wide miss.")
+    _note(sheet, row + 1,
+          "No over/under probability is offered: yardage is long-tailed, and a "
+          "normal curve would understate how often a projection is badly wrong.")
+    _note(sheet, row + 2,
+          "The roster is whoever played in the last four weeks, so a player "
+          "promoted this week is projected on the role he had last month.")
+    _set_widths(sheet, [26, 8, 7, 12, 16])
+
+
 def _build_totals_backtest(sheet, rec: Recorder, last_row: int, derived: pd.DataFrame) -> None:
     """Totals accuracy and over/under record, as live formulas over the Game Log."""
     row = _write_title(
@@ -965,6 +1027,7 @@ _READ_ME = [
     ("text", "Predictions -- the upcoming slate: pick, win probability, confidence tier, the model's spread against the posted line, and its fair moneyline against the posted price."),
     ("text", "Point Totals -- the same slate scored for points: the model's own total, the posted total, the blend of the two, and the over/under it implies."),
     ("text", "Team Totals -- each side's projected points and the first-half split, derived from the game total and the spread."),
+    ("text", "Player Projections -- projected passing, rushing and receiving yards for the players expected to appear."),
     ("text", "Power Ratings -- every franchise's current Elo, and what it is worth in points."),
     ("text", "Backtest Summary -- the model measured against the market, against Elo alone, and against simply picking the home team."),
     ("text", "Calibration -- whether a stated 70% actually wins 70% of the time."),
@@ -1043,6 +1106,7 @@ SLATE_READ_ME = [
     ("text", "Predictions -- pick, win probability, confidence tier, the model's spread against the posted line, and its fair moneyline against the posted price."),
     ("text", "Point Totals -- the model's own total, the posted total, the blend of the two, and the over/under it implies."),
     ("text", "Team Totals -- each side's projected points and the first-half split, derived from the game total and the spread."),
+    ("text", "Player Projections -- projected passing, rushing and receiving yards for the players expected to appear."),
     ("text", "Power Ratings -- every franchise's current Elo, and what it is worth in points."),
     ("blank", ""),
     ("head", "How accurate is it, honestly"),
@@ -1053,7 +1117,8 @@ SLATE_READ_ME = [
 
 
 def export_slate_workbook(
-    path, *, slate: pd.DataFrame, ratings: pd.DataFrame, meta: dict
+    path, *, slate: pd.DataFrame, ratings: pd.DataFrame, meta: dict,
+    props: pd.DataFrame | None = None,
 ) -> Path:
     """Write the slate-only workbook: no backtest, so it takes a second.
 
@@ -1073,7 +1138,7 @@ def export_slate_workbook(
         name: workbook.create_sheet(name)
         for name in (
             "Read Me", "Predictions", "Point Totals", "Team Totals",
-            "Power Ratings",
+            "Player Projections", "Power Ratings",
         )
     }
 
@@ -1081,6 +1146,7 @@ def export_slate_workbook(
     _build_predictions(sheets["Predictions"], rec, slate, meta)
     _build_totals_slate(sheets["Point Totals"], rec, slate, meta)
     _build_team_totals(sheets["Team Totals"], rec, slate, meta)
+    _build_props(sheets["Player Projections"], props, meta)
     _build_ratings(sheets["Power Ratings"], rec, ratings)
 
     workbook.save(path)
@@ -1088,7 +1154,10 @@ def export_slate_workbook(
     return path
 
 
-def export_workbook(path, *, slate: pd.DataFrame, ratings: pd.DataFrame, result, meta: dict) -> Path:
+def export_workbook(
+    path, *, slate: pd.DataFrame, ratings: pd.DataFrame, result, meta: dict,
+    props: pd.DataFrame | None = None,
+) -> Path:
     """Write the full multi-sheet workbook to ``path``."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1104,8 +1173,8 @@ def export_workbook(path, *, slate: pd.DataFrame, ratings: pd.DataFrame, result,
         name: workbook.create_sheet(name)
         for name in (
             "Read Me", "Predictions", "Point Totals", "Team Totals",
-            "Power Ratings", "Backtest Summary", "Calibration",
-            "Against the Spread", "Point Totals Backtest",
+            "Player Projections", "Power Ratings", "Backtest Summary",
+            "Calibration", "Against the Spread", "Point Totals Backtest",
             "Accuracy by Season", "Game Log",
         )
     }
@@ -1125,6 +1194,7 @@ def export_workbook(path, *, slate: pd.DataFrame, ratings: pd.DataFrame, result,
     _build_predictions(sheets["Predictions"], rec, slate, meta)
     _build_totals_slate(sheets["Point Totals"], rec, slate, meta)
     _build_team_totals(sheets["Team Totals"], rec, slate, meta)
+    _build_props(sheets["Player Projections"], props, meta)
     _build_ratings(sheets["Power Ratings"], rec, ratings)
     _build_summary(sheets["Backtest Summary"], rec, last_row, derived, meta)
     _build_calibration(sheets["Calibration"], rec, last_row, derived)

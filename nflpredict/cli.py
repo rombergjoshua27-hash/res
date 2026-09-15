@@ -22,6 +22,7 @@ from . import config, report
 from .backtest import walk_forward
 from .data import load_games, load_half_scores, load_team_game_epa
 from .players import load_injuries, load_player_weeks
+from .props import PropsPredictor, build_player_features, build_slate_rows
 from .edge import attach_edges
 from .elo import EloEngine
 from .features import build_features
@@ -62,6 +63,9 @@ def _build(args) -> Tuple[pd.DataFrame, pd.DataFrame]:
     # Fitting on passer terms that are structurally zero would teach the model
     # a coefficient it can never use, so the switch follows the data.
     args._have_players = not player_weeks.empty
+    args._player_weeks = player_weeks
+    args._injuries = injuries
+    args._games = games
     return games, features
 
 
@@ -99,6 +103,63 @@ def _target_slate(features: pd.DataFrame, args) -> Tuple[int, int]:
             nxt = later.sort_values(["season", "week"]).iloc[0]
             season, week = int(nxt["season"]), int(nxt["week"])
     return season, week
+
+
+def _team_points(history: pd.DataFrame, slate: pd.DataFrame) -> pd.DataFrame:
+    """Projected points per team-game, the way the props model wants them.
+
+    A player's workload follows his offence, so the game model's own view of
+    how many points each side will score is the single most useful piece of
+    context a prop projection can have.
+    """
+    frames = []
+    for source in (history, slate):
+        if source.empty or "home_team_total" not in source.columns:
+            continue
+        for side, column in (("home_team", "home_team_total"), ("away_team", "away_team_total")):
+            frames.append(
+                pd.DataFrame(
+                    {
+                        "game_id": source["game_id"].to_numpy(),
+                        "team": source[side].to_numpy(),
+                        "proj_points": source[column].to_numpy(),
+                    }
+                )
+            )
+    if not frames:
+        return pd.DataFrame(columns=["game_id", "team", "proj_points"])
+    return pd.concat(frames, ignore_index=True).drop_duplicates(["game_id", "team"])
+
+
+def _project_props(features, slate, season, week, args, team_points):
+    """Fit the props model on history and project the upcoming slate."""
+    player_weeks = getattr(args, "_player_weeks", None)
+    if player_weeks is None or player_weeks.empty:
+        return pd.DataFrame()
+
+    period = season * 100 + week
+    played = player_weeks[player_weeks["season"] * 100 + player_weeks["week"] < period]
+    if len(played) < 5000:
+        return pd.DataFrame()
+
+    injuries = getattr(args, "_injuries", pd.DataFrame())
+    games = getattr(args, "_games", None)
+    history = build_player_features(played, games, injuries, team_points)
+    if history.empty:
+        return pd.DataFrame()
+
+    try:
+        model = PropsPredictor().fit(history)
+    except ValueError:
+        return pd.DataFrame()
+
+    rows = build_slate_rows(played, games, slate, injuries, team_points)
+    if rows.empty:
+        return pd.DataFrame()
+
+    projections = model.predict(rows)
+    projections["availability"] = rows["availability"].to_numpy()
+    return projections
 
 
 def _qb_features_enabled(args) -> bool:
@@ -196,14 +257,22 @@ def _predict_slate(features: pd.DataFrame, season: int, week: int, args):
     splits = SplitPredictor().fit(calibration)
     merged = _attach(merged, splits.predict(merged))
 
+    calibration = _attach(calibration, splits.predict(calibration))
+    team_points = _team_points(calibration, merged)
+
     enriched = attach_edges(merged).sort_values("pick_prob", ascending=False)
-    return enriched, winner, totals, history, splits
+    props = (
+        pd.DataFrame()
+        if args.no_props
+        else _project_props(features, slate, season, week, args, team_points)
+    )
+    return enriched, winner, totals, history, splits, props
 
 
 def cmd_predict(args) -> int:
     _, features = _build(args)
     season, week = _target_slate(features, args)
-    enriched, predictor, totals, history, splits = _predict_slate(
+    enriched, predictor, totals, history, splits, props = _predict_slate(
         features, season, week, args
     )
 
@@ -218,10 +287,13 @@ def cmd_predict(args) -> int:
     print(report.format_totals(enriched, sigma=totals.report.sigma))
     print()
     print(report.format_splits(enriched))
+    if not props.empty:
+        print()
+        print(report.format_props(props))
 
     if not args.no_excel:
         print("\n" + _write_slate_workbook(enriched, features, season, week, args,
-                                            predictor, totals, history))
+                                            predictor, totals, history, props))
 
     if args.csv:
         columns = [
@@ -240,7 +312,8 @@ def cmd_predict(args) -> int:
 
 
 def _write_slate_workbook(
-    enriched, features, season: int, week: int, args, predictor, totals, history
+    enriched, features, season: int, week: int, args, predictor, totals, history,
+    props=None,
 ) -> str:
     """Write the slate-only workbook and return a line describing where it went.
 
@@ -270,7 +343,7 @@ def _write_slate_workbook(
         config.OUTPUT_DIR / f"slate_{season}_wk{week:02d}.xlsx"
     )
     export_slate_workbook(
-        path, slate=enriched, ratings=engine.current_ratings(), meta=meta
+        path, slate=enriched, ratings=engine.current_ratings(), meta=meta, props=props
     )
     return f"Workbook written to {path}"
 
@@ -370,7 +443,7 @@ def cmd_export(args) -> int:
     _, features = _build(args)
 
     season, week = _target_slate(features, args)
-    slate_out, predictor, totals, history, splits = _predict_slate(
+    slate_out, predictor, totals, history, splits, props = _predict_slate(
         features, season, week, args
     )
 
@@ -408,10 +481,13 @@ def cmd_export(args) -> int:
     path = Path(args.output) if args.output else (
         config.OUTPUT_DIR / f"nflpredict_{season}_wk{week:02d}.xlsx"
     )
-    export_workbook(path, slate=slate_out, ratings=ratings, result=result, meta=meta)
+    export_workbook(
+        path, slate=slate_out, ratings=ratings, result=result,
+        meta=meta, props=props,
+    )
     print(f"Workbook written to {path}")
     print(
-        f"  10 sheets | {len(slate_out)} slate games | {len(ratings)} teams | "
+        f"  12 sheets | {len(slate_out)} slate games | {len(ratings)} teams | "
         f"{len(result.predictions):,} backtested games"
     )
     return 0
@@ -462,6 +538,10 @@ def _common_options() -> argparse.ArgumentParser:
             "model weight when blending with the posted total "
             f"(default: {config.DEFAULT_TOTAL_MARKET_BLEND})"
         ),
+    )
+    common.add_argument(
+        "--no-props", action="store_true",
+        help="skip player prop projections",
     )
     common.add_argument(
         "--no-players", action="store_true",

@@ -12,7 +12,8 @@ import pandas as pd
 from . import config
 
 __all__ = [
-    "format_slate", "format_totals", "format_splits", "format_backtest",
+    "format_slate", "format_totals", "format_splits", "format_props",
+    "format_backtest",
     "format_ratings", "HONESTY_NOTE", "TOTALS_NOTE", "SPLITS_NOTE",
 ]
 
@@ -43,6 +44,19 @@ SPLITS_NOTE = (
     "full game."
 )
 
+PROPS_NOTE = (
+    "Props are the least certain thing here. Walk-forward over 2012-2026, for\n"
+    "players with real involvement, the projections miss by 62 passing yards,\n"
+    "24 rushing and 23 receiving. Against that player's own recent average\n"
+    "(68 / 26 / 25) that is a clear gain; against simply quoting the league\n"
+    "average for the position (64 / 27 / 26) it is a clear gain on the two\n"
+    "rushing and receiving numbers and a slim one on passing yards, where\n"
+    "starting quarterbacks cluster tightly enough that the average is hard to\n"
+    "beat. Either way a 60-yard miss on a passing projection is a wide miss.\n"
+    "Yardage is long-tailed, so no over/under probability is offered: a normal\n"
+    "curve would understate the outliers. The roster is whoever played\n"
+    "recently, so a player promoted this week is projected on last month's role."
+)
 _RULE = "-" * 78
 
 
@@ -212,6 +226,40 @@ def format_splits(frame: pd.DataFrame) -> str:
         "construction. 1H SPR is the first-half spread from the home side.",
         "", SPLITS_NOTE, _RULE,
     ]
+    return "\n".join(lines)
+
+
+def format_props(props: pd.DataFrame, *, top: int = 12) -> str:
+    """Render the leading player projections for one slate."""
+    if props.empty:
+        return "No player projections available for this slate."
+
+    lines = [_RULE, "PLAYER PROJECTIONS", _RULE]
+    sections = (
+        ("proj_passing_yards", "PASSING YARDS"),
+        ("proj_rushing_yards", "RUSHING YARDS"),
+        ("proj_receiving_yards", "RECEIVING YARDS"),
+    )
+    for column, title in sections:
+        if column not in props.columns or props[column].isna().all():
+            continue
+        ranked = props.nlargest(top, column)
+        ranked = ranked[ranked[column] > 0]
+        if ranked.empty:
+            continue
+        lines += ["", title, "-" * 46]
+        lines.append(f"{'PLAYER':<26}{'TEAM':<6}{'POS':<5}{'PROJ':>7}")
+        for row in ranked.itertuples(index=False):
+            name = str(getattr(row, "player_display_name", ""))[:25]
+            flag = "" if getattr(row, "availability", 1.0) >= 0.999 else "  ?"
+            lines.append(
+                f"{name:<26}{str(getattr(row, 'team', '')):<6}"
+                f"{str(getattr(row, 'position', '')):<5}"
+                f"{getattr(row, column):>7.1f}{flag}"
+            )
+
+    lines += [_RULE, "? marks a player listed on the injury report; his projection is",
+              "scaled by how often that status actually plays.", "", PROPS_NOTE, _RULE]
     return "\n".join(lines)
 
 

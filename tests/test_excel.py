@@ -94,8 +94,8 @@ def test_workbook_has_every_expected_sheet(workbook):
     path, _ = workbook
     assert load_workbook(path).sheetnames == [
         "Read Me", "Predictions", "Point Totals", "Team Totals",
-        "Power Ratings", "Backtest Summary", "Calibration",
-        "Against the Spread", "Point Totals Backtest",
+        "Player Projections", "Power Ratings", "Backtest Summary",
+        "Calibration", "Against the Spread", "Point Totals Backtest",
         "Accuracy by Season", "Game Log",
     ]
 
