@@ -168,7 +168,7 @@ git clone <this repo> && cd res
 pip install -e .
 ```
 
-Python 3.9+. The first run downloads ~400 MB of play-by-play and distills it
+Python 3.10+, tested on 3.10 and 3.13 in CI. The first run downloads ~400 MB of play-by-play and distills it
 to ~60 KB per season of cached summaries; subsequent runs are instant. Pass
 `--epa-start 2018` to start with a much smaller download.
 
