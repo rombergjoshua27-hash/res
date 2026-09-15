@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from nflpredict import data
+from nflpredict import data, players
 
 TEST_SEASONS = range(2018, 2024)
 
@@ -28,3 +28,13 @@ def team_epa():
 @pytest.fixture(scope="session")
 def all_games():
     return data.load_games(quiet=True)
+
+
+@pytest.fixture(scope="session")
+def player_weeks():
+    return players.load_player_weeks(TEST_SEASONS, quiet=True)
+
+
+@pytest.fixture(scope="session")
+def injuries():
+    return players.load_injuries(TEST_SEASONS, quiet=True)

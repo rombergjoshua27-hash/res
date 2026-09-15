@@ -18,6 +18,7 @@ PACKAGE_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = PACKAGE_ROOT.parent
 DATA_DIR = Path(os.environ.get("NFLPREDICT_DATA_DIR", PROJECT_ROOT / "data"))
 EPA_CACHE_DIR = DATA_DIR / "epa"
+PLAYER_CACHE_DIR = DATA_DIR / "players"
 OUTPUT_DIR = Path(os.environ.get("NFLPREDICT_OUT_DIR", PROJECT_ROOT / "out"))
 
 # --------------------------------------------------------------------------
@@ -30,6 +31,15 @@ PBP_URL_TEMPLATE = (
     "play_by_play_{season}.csv.gz"
 )
 
+PLAYER_STATS_URL_TEMPLATE = (
+    "https://github.com/nflverse/nflverse-data/releases/download/stats_player/"
+    "stats_player_week_{season}.csv"
+)
+INJURIES_URL_TEMPLATE = (
+    "https://github.com/nflverse/nflverse-data/releases/download/injuries/"
+    "injuries_{season}.csv"
+)
+
 # Re-download the schedule file if the cached copy is older than this.
 # Scores and lines move during the week, so keep this short.
 GAMES_CACHE_HOURS = 6.0
@@ -40,6 +50,17 @@ FIRST_PBP_SEASON = 1999
 # Bumped whenever the team-game aggregate schema changes, so a stale cache is
 # rebuilt rather than read back with columns silently missing.
 EPA_CACHE_VERSION = 2
+
+# Per-player weekly stats run the full length of the game log. Injury reports
+# start later, so any model using them must degrade gracefully before 2009.
+FIRST_PLAYER_STATS_SEASON = 1999
+FIRST_INJURY_SEASON = 2009
+PLAYER_CACHE_VERSION = 1
+
+# Injury report statuses, in order of severity. A player not on the report at
+# all is available; "Out" never plays. EMPIRICAL play rates from 2009-2026 are
+# measured in `players.py`.
+INJURY_STATUS_ORDER = ("Out", "Doubtful", "Questionable")
 
 DOWNLOAD_RETRIES = 4
 DOWNLOAD_BACKOFF_SECONDS = 2.0
@@ -116,6 +137,30 @@ REST_DIFF_CAP_DAYS = 10.0
 # Kept behind a flag (`--qb-adjustment`) rather than deleted so the
 # experiment stays reproducible.
 ELO_USE_QB_DEFAULT = False
+
+# The *second* quarterback attempt, which did work, and is on by default.
+#
+# `qb.py` rates a passer by completion percentage over expected and EPA per
+# dropback -- measures computed per throw, not per team play -- and feeds the
+# model the *change* from the quarterback a team has been playing, plus an
+# injury-report availability term. The weights are fitted, not chosen.
+#
+# Walk-forward 2008-2026, 4,912 games:
+#
+#                        accuracy   brier    log loss
+#   market off, base       65.07%   0.2186     0.6281
+#   market off, + QB       64.98%   0.2171     0.6247   <- p=0.002 on Brier
+#   market on,  base       66.61%   0.2099     0.6087
+#   market on,  + QB       66.59%   0.2099     0.6085   <- p=0.064
+#
+# Unchanged accuracy, significantly better probabilities, market-free: on the
+# 280 games where the two disagreed on the pick it was 138-142, a dead heat,
+# while the paired Brier improvement is real. With the market on it is a wash
+# -- the closing line already prices a backup quarterback and a Friday injury
+# report, so only 13 of 4,912 picks moved.
+# It is on because the market-free path is the one that matters when no line
+# is posted; `--no-qb-features` turns it off.
+USE_QB_FEATURES_DEFAULT = True
 QB_EWMA_ALPHA = 0.25          # responsiveness of a QB's own rolling rating
 QB_SHRINK_GAMES = 8.0         # games of league-average prior before trusting
 QB_EPA_TO_POINTS = 45.0       # 0.10 EPA/play gap ~= 4.5 points of spread

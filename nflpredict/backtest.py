@@ -266,6 +266,7 @@ def walk_forward(
     use_market: bool = True,
     market_blend: float = config.DEFAULT_MARKET_BLEND,
     total_blend: float = config.DEFAULT_TOTAL_MARKET_BLEND,
+    use_qb_features: bool = config.USE_QB_FEATURES_DEFAULT,
     refit: str = "week",
     min_train_games: int = 600,
     quiet: bool = False,
@@ -307,7 +308,9 @@ def walk_forward(
         need_refit = refit == "week" or fitted_for_season != season
         if need_refit or predictor is None:
             predictor = GamePredictor(
-                use_market=use_market, market_blend=market_blend
+                use_market=use_market,
+                market_blend=market_blend,
+                use_qb_features=use_qb_features,
             ).fit(history)
             totals_predictor = TotalsPredictor(
                 use_market=use_market, market_blend=total_blend

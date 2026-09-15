@@ -18,11 +18,12 @@ import pandas as pd
 
 from . import config
 from .elo import EloEngine
+from .qb import QB_FEATURES, build_availability_features, build_qb_features
 
 __all__ = [
     "build_features", "FEATURE_COLUMNS", "TOTAL_FEATURE_COLUMNS",
     "MARKET_COLUMNS", "MARKET_TOTAL_COLUMNS", "TEAM_STATS", "TOTALS_STATS",
-    "ROLLED_STATS",
+    "ROLLED_STATS", "QB_FEATURE_COLUMNS",
 ]
 
 
@@ -65,6 +66,12 @@ FEATURE_COLUMNS: List[str] = [
     "is_playoff",
     "form_confidence",
 ]
+
+# Passer-change and roster-availability terms. Kept in their own list and
+# off by default, because an earlier quarterback adjustment made the model
+# measurably worse and this one has to earn its place the same way -- by
+# backtest, not by argument. See `qb.py` and the README.
+QB_FEATURE_COLUMNS: List[str] = list(QB_FEATURES)
 
 # Inputs to the totals model. Like the win model these never touch a
 # betting market -- the posted total is blended in afterwards.
@@ -287,6 +294,8 @@ def build_features(
     team_epa: pd.DataFrame | None = None,
     *,
     elo_engine: EloEngine | None = None,
+    player_weeks: pd.DataFrame | None = None,
+    injuries: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Attach Elo, rolling-form and market columns to every game.
 
@@ -358,12 +367,20 @@ def build_features(
 
     _attach_totals_features(out)
 
+    # Passer and availability terms. Always present as columns so callers can
+    # rely on the schema; zero throughout when no player data was supplied,
+    # which reads to the model as "no change and no absentees".
+    qb_frame = build_qb_features(out, player_weeks)
+    availability = build_availability_features(out, player_weeks, injuries)
+    out = out.merge(qb_frame, on="game_id", how="left")
+    out = out.merge(availability, on="game_id", how="left")
+
     out["market_spread"] = out["spread_line"].astype(float)
     out["has_market"] = out["market_spread"].notna().astype(float)
     out["market_total"] = out["total_line"].astype(float)
     out["has_market_total"] = out["market_total"].notna().astype(float)
 
-    for column in FEATURE_COLUMNS + TOTAL_FEATURE_COLUMNS:
+    for column in FEATURE_COLUMNS + TOTAL_FEATURE_COLUMNS + QB_FEATURE_COLUMNS:
         out[column] = pd.to_numeric(out[column], errors="coerce").fillna(0.0)
 
     return out

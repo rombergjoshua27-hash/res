@@ -21,6 +21,7 @@ import pandas as pd
 from . import config, report
 from .backtest import walk_forward
 from .data import load_games, load_team_game_epa
+from .players import load_injuries, load_player_weeks
 from .edge import attach_edges
 from .elo import EloEngine
 from .features import build_features
@@ -44,8 +45,20 @@ def _build(args) -> Tuple[pd.DataFrame, pd.DataFrame]:
         if args.no_epa
         else load_team_game_epa(seasons, quiet=args.quiet)
     )
+
+    player_weeks = injuries = pd.DataFrame()
+    if not args.no_players:
+        player_weeks = load_player_weeks(seasons, quiet=args.quiet)
+        injuries = load_injuries(seasons, quiet=args.quiet)
+
     engine = EloEngine(use_qb=args.qb_adjustment)
-    features = build_features(games, epa, elo_engine=engine)
+    features = build_features(
+        games, epa, elo_engine=engine,
+        player_weeks=player_weeks, injuries=injuries,
+    )
+    # Fitting on passer terms that are structurally zero would teach the model
+    # a coefficient it can never use, so the switch follows the data.
+    args._have_players = not player_weeks.empty
     return games, features
 
 
@@ -85,6 +98,13 @@ def _target_slate(features: pd.DataFrame, args) -> Tuple[int, int]:
     return season, week
 
 
+def _qb_features_enabled(args) -> bool:
+    """Whether the passer and availability terms should be fitted at all."""
+    if args.no_qb_features:
+        return False
+    return bool(getattr(args, "_have_players", False))
+
+
 def _training_history(features: pd.DataFrame, season: int, week: int) -> pd.DataFrame:
     """Every game that had finished before the target slate kicks off.
 
@@ -115,7 +135,9 @@ def _fit_through(
             "not enough history to fit"
         )
     winner = GamePredictor(
-        use_market=not args.no_market, market_blend=args.market_blend
+        use_market=not args.no_market,
+        market_blend=args.market_blend,
+        use_qb_features=_qb_features_enabled(args),
     ).fit(history)
     totals = TotalsPredictor(
         use_market=not args.no_market,
@@ -182,6 +204,10 @@ def cmd_predict(args) -> int:
     print()
     print(report.format_totals(enriched, sigma=totals.report.sigma))
 
+    if not args.no_excel:
+        print("\n" + _write_slate_workbook(enriched, features, season, week, args,
+                                            predictor, totals, history))
+
     if args.csv:
         columns = [
             "game_id", "season", "week", "away_team", "home_team", "pick",
@@ -196,6 +222,42 @@ def cmd_predict(args) -> int:
         enriched[[c for c in columns if c in enriched.columns]].to_csv(path, index=False)
         print(f"\nCSV written to {path}")
     return 0
+
+
+def _write_slate_workbook(
+    enriched, features, season: int, week: int, args, predictor, totals, history
+) -> str:
+    """Write the slate-only workbook and return a line describing where it went.
+
+    Separate from ``export`` because this one skips the backtest entirely: a
+    weekly run should cost a second, not the several minutes it takes to
+    replay nineteen seasons.
+    """
+    from datetime import datetime
+
+    from .excel import export_slate_workbook
+
+    engine = EloEngine(use_qb=args.qb_adjustment)
+    engine.run(load_games(quiet=True))
+
+    meta = {
+        "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "slate_season": season,
+        "slate_week": week,
+        "slate_train": predictor.report.n_train,
+        "market_blend": args.market_blend,
+        "total_blend": args.total_blend,
+        "total_sigma": totals.report.sigma,
+        "slate_history_note": _history_note(history, season).lstrip(", "),
+    }
+
+    path = Path(args.excel) if args.excel else (
+        config.OUTPUT_DIR / f"slate_{season}_wk{week:02d}.xlsx"
+    )
+    export_slate_workbook(
+        path, slate=enriched, ratings=engine.current_ratings(), meta=meta
+    )
+    return f"Workbook written to {path}"
 
 
 def _history_note(history: pd.DataFrame, season: int) -> str:
@@ -238,6 +300,7 @@ def cmd_backtest(args) -> int:
         use_market=not args.no_market,
         market_blend=args.market_blend,
         total_blend=args.total_blend,
+        use_qb_features=_qb_features_enabled(args),
         refit=args.refit,
         quiet=args.quiet,
     )
@@ -273,6 +336,7 @@ def cmd_evaluate(args) -> int:
         use_market=not args.no_market,
         market_blend=args.market_blend,
         total_blend=args.total_blend,
+        use_qb_features=_qb_features_enabled(args),
         refit=args.refit,
         quiet=args.quiet,
     )
@@ -306,6 +370,7 @@ def cmd_export(args) -> int:
         use_market=not args.no_market,
         market_blend=args.market_blend,
         total_blend=args.total_blend,
+        use_qb_features=_qb_features_enabled(args),
         refit=args.refit,
         quiet=args.quiet,
     )
@@ -382,6 +447,14 @@ def _common_options() -> argparse.ArgumentParser:
         ),
     )
     common.add_argument(
+        "--no-players", action="store_true",
+        help="skip player stats and injury reports entirely",
+    )
+    common.add_argument(
+        "--no-qb-features", action="store_true",
+        help="load player data but leave the passer/availability terms out of the fit",
+    )
+    common.add_argument(
         "--qb-adjustment", action="store_true",
         help="enable the Elo QB term (measurably worse; see config.py)",
     )
@@ -406,6 +479,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     predict.add_argument("--season", type=int, help="season (default: current)")
     predict.add_argument("--week", type=int, help="week (default: next unplayed)")
+    predict.add_argument(
+        "--no-excel", action="store_true",
+        help="skip the workbook and print to the terminal only",
+    )
+    predict.add_argument(
+        "--excel", metavar="PATH",
+        help="workbook path (default: out/slate_<season>_wk<week>.xlsx)",
+    )
     predict.set_defaults(func=cmd_predict)
 
     backtest = subparsers.add_parser(

@@ -36,7 +36,7 @@ from openpyxl.utils import get_column_letter
 
 from . import config
 
-__all__ = ["export_workbook"]
+__all__ = ["export_workbook", "export_slate_workbook"]
 
 FONT = "Arial"
 
@@ -920,9 +920,9 @@ _READ_ME = [
 ]
 
 
-def _build_read_me(sheet, meta: dict) -> None:
+def _build_read_me(sheet, meta: dict, *, content=None) -> None:
     row = 1
-    for kind, text in _READ_ME:
+    for kind, text in (content if content is not None else _READ_ME):
         if kind == "blank":
             row += 1
             continue
@@ -937,17 +937,21 @@ def _build_read_me(sheet, meta: dict) -> None:
         row += 1
 
     row += 1
-    for label, value in (
-        ("Generated", meta["generated"]),
-        ("Backtest range", f"{meta['start']}-{meta['end']}"),
-        ("Games backtested", f"{meta['n_games']:,}"),
+    facts = [("Generated", meta["generated"])]
+    if "n_games" in meta:
+        facts += [
+            ("Backtest range", f"{meta['start']}-{meta['end']}"),
+            ("Games backtested", f"{meta['n_games']:,}"),
+        ]
+    for label, value in facts + [
         ("Slate", f"{meta['slate_season']} week {meta['slate_week']}"),
+        ("Games in the fit", f"{meta['slate_train']:,}"),
         ("Market blend weight (sides)", f"{meta['market_blend']:.2f}"),
         ("Market blend weight (totals)", f"{meta.get('total_blend', 0.10):.2f}"),
         ("Totals sigma (points)", f"{meta.get('total_sigma', float('nan')):.2f}"),
         ("Current-season games in fit", meta.get("slate_history_note") or "none yet"),
         ("Data source", "nflverse (nfldata game log + nflverse-data play-by-play)"),
-    ):
+    ]:
         _value(sheet, row, 1, label, font=_BOLD)
         _value(sheet, row, 2, value)
         row += 1
@@ -959,6 +963,53 @@ def _build_read_me(sheet, meta: dict) -> None:
 # --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
+
+
+SLATE_READ_ME = [
+    ("title", "nflpredict -- Slate Workbook"),
+    ("blank", ""),
+    ("head", "What is in here"),
+    ("text", "Predictions -- pick, win probability, confidence tier, the model's spread against the posted line, and its fair moneyline against the posted price."),
+    ("text", "Point Totals -- the model's own total, the posted total, the blend of the two, and the over/under it implies."),
+    ("text", "Power Ratings -- every franchise's current Elo, and what it is worth in points."),
+    ("blank", ""),
+    ("head", "How accurate is it, honestly"),
+    ("text", "About two games in three. Walk-forward across 2008-2026 it hits 66.6% straight up, which is level with the Vegas closing line and no better than it. Roughly a third of NFL games turn on events with no predictable structure."),
+    ("text", "Against the spread it wins 49.6% and loses money at standard -110 pricing, where 52.38% is breakeven. Point totals miss the final number by about 10.7 points on average against the closing total's 10.5, and over/under picks hit 50.8%."),
+    ("text", "This workbook carries the slate only. For the full backtest evidence behind those figures -- calibration, per-season accuracy, the against-the-spread and over/under records, and the game-by-game log they are all computed from -- run:  nflpredict export"),
+]
+
+
+def export_slate_workbook(
+    path, *, slate: pd.DataFrame, ratings: pd.DataFrame, meta: dict
+) -> Path:
+    """Write the slate-only workbook: no backtest, so it takes a second.
+
+    Same sheets a reader looks at every week, without re-running 19 seasons
+    of walk-forward to produce them. ``export_workbook`` remains the full
+    article, and the Read Me here points at it.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    workbook.calculation.fullCalcOnLoad = True
+
+    rec = Recorder()
+    sheets = {
+        name: workbook.create_sheet(name)
+        for name in ("Read Me", "Predictions", "Point Totals", "Power Ratings")
+    }
+
+    _build_read_me(sheets["Read Me"], meta, content=SLATE_READ_ME)
+    _build_predictions(sheets["Predictions"], rec, slate, meta)
+    _build_totals_slate(sheets["Point Totals"], rec, slate, meta)
+    _build_ratings(sheets["Power Ratings"], rec, ratings)
+
+    workbook.save(path)
+    _inject_cached_values(path, rec)
+    return path
 
 
 def export_workbook(path, *, slate: pd.DataFrame, ratings: pd.DataFrame, result, meta: dict) -> Path:
