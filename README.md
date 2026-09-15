@@ -223,7 +223,7 @@ returns the live scorecard.
 
 ## The Excel workbook
 
-`nflpredict predict` writes **six tabs and nothing else** — the week, in the
+`nflpredict predict` writes **seven tabs and nothing else** — the week, in the
 order you would look at it:
 
 | Tab | What it holds |
@@ -234,6 +234,7 @@ order you would look at it:
 | **Player Projections** | Projected passing, rushing and receiving yards |
 | **Matchup Picker** | Two dropdowns — pick any teams, everything recalculates |
 | **Power Ratings** | Every team, strongest first |
+| **Last Week** | How the last slate's picks actually turned out, graded on all three markets |
 
 About 20 KB, a few seconds to build. Each tab carries its own one-line
 accuracy note at the foot, so no claim travels without the number it applies
