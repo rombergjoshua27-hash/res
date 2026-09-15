@@ -309,6 +309,80 @@ OU_BY_EDGE = (
 BREAKEVEN_AT_STANDARD_VIG = 0.5238
 
 # --------------------------------------------------------------------------
+# Per-game confidence on the spread and the total
+# --------------------------------------------------------------------------
+#
+# The tables above bucket by the *blended* number's edge, which is the wrong
+# quantity to rate a bet by: blending pulls the forecast onto the line, so the
+# blended edge spans barely four points and every pick looks identical. The
+# model's own unblended number disagrees with the market by up to twenty-one
+# points, and that is the quantity worth showing.
+#
+# These are logistic fits of "did this pick win" on the unblended edge in
+# points, over the 2008-2026 walk-forward. (intercept, slope).
+#
+# Both slopes are positive, and both confidence intervals contain zero:
+#
+#   totals   slope +0.0288  95% CI [-0.0012, +0.0563]  n=4,853
+#   spreads  slope +0.0086  95% CI [-0.0186, +0.0369]  n=4,788
+#
+# So a bigger disagreement with the line is associated with a slightly better
+# result, and the association is not distinguishable from chance. The fits are
+# used to *differentiate* picks -- which is honest, the edge is a real measured
+# quantity -- and not to claim any of them beats the vig. Anything derived from
+# them is clamped by CONVICTION_CAP below.
+OU_EDGE_FIT = (-0.039792, 0.028793)
+ATS_EDGE_FIT = (0.014211, 0.008616)
+
+# Realised win rate by size of the unblended edge: (minimum points, bets, rate).
+# The 6+ rows clear breakeven, on 263-277 bets, where the standard error is
+# about three points of win rate. They are suggestive and they are not
+# significant, and the sample size is printed beside every one of them so the
+# reader can see which.
+ATS_BY_MODEL_EDGE = (
+    (6.0, 263, 0.540),
+    (4.0, 608, 0.508),
+    (2.0, 1491, 0.518),
+    (0.0, 2426, 0.500),
+)
+OU_BY_MODEL_EDGE = (
+    (6.0, 277, 0.538),
+    (4.0, 652, 0.521),
+    (2.0, 1521, 0.513),
+    (0.0, 2403, 0.497),
+)
+
+# How far the fitted curve is allowed to run, and the most important line in
+# this block.
+#
+# The curve is a point estimate off a slope whose confidence interval contains
+# zero. Left uncapped it quotes 56% on a large edge, which is above the 52.38%
+# needed at -110, so the tab would start advertising profitable bets on the
+# strength of a relationship it cannot demonstrate. It did exactly that for one
+# commit, and the test that forbids a positive expected value caught it.
+#
+# Capping at breakeven is the honest ceiling: the most this evidence supports
+# saying about any spread or total is "a coin flip against the price". Below the
+# cap the ranking is fully differentiated, which is the point of the column; at
+# the cap it stops, which is the point of the cap. Roughly one total in seven
+# reaches it and almost no spread does, so little ordering is lost.
+#
+# The measured band rate is still printed raw beside each pick, sample size and
+# all, so where the realised rate runs past this ceiling the reader can see it
+# and see what it rests on.
+CONVICTION_CAP = BREAKEVEN_AT_STANDARD_VIG
+
+# Labels for how far the model sits from the posted number. These describe the
+# size of the disagreement, not a claim about winning: a BIG edge means the
+# model and the market disagree by six points or more, and nothing else.
+CONVICTION_TIERS = (
+    (6.0, "BIG"),
+    (4.0, "MODERATE"),
+    (2.0, "SLIGHT"),
+    (0.0, "NONE"),
+)
+
+# --------------------------------------------------------------------------
 # Franchise continuity
 # --------------------------------------------------------------------------
 

@@ -562,9 +562,14 @@ def _picks_rows(path):
         rows.append(
             {
                 "market": market,
-                "confidence": sheet.cell(r, 4).value,
-                "rating": sheet.cell(r, 5).value,
-                "ev": sheet.cell(r, 7).value,
+                "game": sheet.cell(r, 2).value,
+                "pick": sheet.cell(r, 3).value,
+                "model": sheet.cell(r, 4).value,
+                "line": sheet.cell(r, 5).value,
+                "edge": sheet.cell(r, 6).value,
+                "confidence": sheet.cell(r, 7).value,
+                "rating": sheet.cell(r, 8).value,
+                "ev": sheet.cell(r, 10).value,
             }
         )
     return rows
@@ -577,23 +582,90 @@ def test_every_game_gets_a_pick_in_all_three_markets(simple_workbook, workbook_i
         assert len([r for r in rows if r["market"] == market]) == len(slate)
 
 
-def test_picks_are_ranked_by_confidence(simple_workbook):
-    confidences = [r["confidence"] for r in _picks_rows(simple_workbook)]
-    assert confidences == sorted(confidences, reverse=True)
+def test_picks_are_ranked_within_each_market(simple_workbook):
+    """Ranked inside its own market, not across all three.
+
+    A moneyline at 86% and a spread at 53% are not competing for the same
+    slot, and sorting them into one list buries every spread under every
+    moneyline. Each block is ordered on its own.
+    """
+    rows = _picks_rows(simple_workbook)
+    for market in ("Moneyline", "Spread", "Total"):
+        block = [r["confidence"] for r in rows if r["market"] == market]
+        assert block == sorted(block, reverse=True)
 
 
-def test_spread_and_total_picks_are_rated_a_coin_flip(simple_workbook):
-    """What nineteen seasons say they are, whatever the model's edge looks like."""
+def test_spread_and_total_confidence_actually_varies(simple_workbook):
+    """The whole point of rating them off the model's own edge.
+
+    The first version of this tab printed one global base rate on every
+    spread and every total, so sixteen games all read 49.6% and there was
+    nothing to choose between them. The rating now comes from how far the
+    model's unblended number sits from the posted line, which differs game
+    to game, so the column has to differ game to game as well.
+    """
+    rows = _picks_rows(simple_workbook)
+    for market in ("Spread", "Total"):
+        rated = {round(r["confidence"], 4) for r in rows if r["market"] == market}
+        assert len(rated) > 1, f"{market} confidence is constant again"
+
+
+def test_edge_is_the_model_minus_the_line(simple_workbook):
+    """The ranking key is shown, not just applied."""
+    for row in _picks_rows(simple_workbook):
+        if row["market"] == "Moneyline":
+            continue
+        assert row["edge"] == pytest.approx(row["model"] - row["line"], abs=5e-2)
+
+
+def test_confidence_is_capped_where_the_fit_stops_speaking(simple_workbook):
+    """No extrapolating the curve past the edges it was measured over."""
     from nflpredict import config
 
-    rows = _picks_rows(simple_workbook)
-    for market, expected in (
-        ("Spread", config.ATS_BY_EDGE[-1][2]),
-        ("Total", config.OU_BY_EDGE[-1][2]),
-    ):
-        rated = [r["confidence"] for r in rows if r["market"] == market]
-        assert rated == pytest.approx([expected] * len(rated))
-        assert {r["rating"] for r in rows if r["market"] == market} == {"COIN FLIP"}
+    for row in _picks_rows(simple_workbook):
+        if row["market"] == "Moneyline":
+            continue
+        assert row["confidence"] <= config.CONVICTION_CAP + 1e-9
+
+
+def test_the_spread_pick_is_laid_at_the_right_sign(simple_workbook, workbook_inputs):
+    """A favourite must read as a favourite.
+
+    ``market_spread`` is the home team's expected margin, so a home favourite
+    is a positive line laid at the negative of it. Passing the line straight
+    through inverts every row, and a tab that calls a thirteen-point underdog
+    "MIA -13.5" is worse than one that says nothing.
+    """
+    slate = workbook_inputs[0].set_index("game_id")
+    lines = {
+        f"{g.away_team} @ {g.home_team}": (g.home_team, float(g.market_spread))
+        for g in slate.itertuples()
+        if pd.notna(g.market_spread)
+    }
+    checked = 0
+    for row in _picks_rows(simple_workbook):
+        if row["market"] != "Spread" or row["pick"] is None:
+            continue
+        team, number = row["pick"].rsplit(" ", 1)
+        home, line = lines[row["game"]]
+        expected = -line if team == home else line
+        assert float(number) == pytest.approx(expected), row["pick"]
+        checked += 1
+    assert checked
+
+
+def test_rating_describes_the_edge_not_the_odds(simple_workbook):
+    """BIG means six points apart. It must not read as a confidence tier."""
+    from nflpredict import config
+
+    for row in _picks_rows(simple_workbook):
+        if row["market"] == "Moneyline":
+            continue
+        expected = next(
+            label for threshold, label in config.CONVICTION_TIERS
+            if abs(row["edge"]) >= threshold
+        )
+        assert row["rating"] == expected
 
 
 def test_no_pick_is_given_a_positive_expected_value(simple_workbook):
@@ -631,4 +703,5 @@ def test_the_tab_states_the_breakeven_it_is_measured_against(simple_workbook):
         if isinstance(cell.value, str)
     )
     assert "52.38%" in text
-    assert "23" in text or "twenty-three" in text  # the small-sample warning
+    # the caveat that the slope behind the ranking is not significant
+    assert "contains zero" in text
