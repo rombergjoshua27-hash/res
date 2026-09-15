@@ -2,6 +2,7 @@
 
     nflpredict predict                 # next unplayed slate
     nflpredict predict --week 5        # a specific week
+    nflpredict track                   # grade this season's picks so far
     nflpredict backtest                # prove the accuracy claim
     nflpredict ratings                 # current Elo power ratings
     nflpredict evaluate --season 2025  # score a finished season
@@ -19,7 +20,7 @@ from typing import Tuple
 import pandas as pd
 
 from . import config, report
-from .backtest import walk_forward
+from .backtest import track_season, walk_forward
 from .data import load_games, load_half_scores, load_team_game_epa
 from .players import load_injuries, load_player_weeks
 from .props import PropsPredictor, build_player_features, build_slate_rows
@@ -266,13 +267,24 @@ def _predict_slate(features: pd.DataFrame, season: int, week: int, args):
         if args.no_props
         else _project_props(features, slate, season, week, args, team_points)
     )
-    return enriched, winner, totals, history, splits, props
+    scorecard = (
+        None
+        if args.no_scorecard
+        else track_season(
+            features, season,
+            use_market=not args.no_market,
+            market_blend=args.market_blend,
+            total_blend=args.total_blend,
+            use_qb_features=_qb_features_enabled(args),
+        )
+    )
+    return enriched, winner, totals, history, splits, props, scorecard
 
 
 def cmd_predict(args) -> int:
     _, features = _build(args)
     season, week = _target_slate(features, args)
-    enriched, predictor, totals, history, splits, props = _predict_slate(
+    enriched, predictor, totals, history, splits, props, scorecard = _predict_slate(
         features, season, week, args
     )
 
@@ -290,10 +302,14 @@ def cmd_predict(args) -> int:
     if not props.empty:
         print()
         print(report.format_props(props))
+    if scorecard is not None and not scorecard.games.empty:
+        print()
+        print(report.format_scorecard(scorecard))
 
     if not args.no_excel:
         print("\n" + _write_slate_workbook(enriched, features, season, week, args,
-                                            predictor, totals, history, props))
+                                            predictor, totals, history, props,
+                                            scorecard))
 
     if args.csv:
         columns = [
@@ -313,7 +329,7 @@ def cmd_predict(args) -> int:
 
 def _write_slate_workbook(
     enriched, features, season: int, week: int, args, predictor, totals, history,
-    props=None,
+    props=None, scorecard=None,
 ) -> str:
     """Write the slate-only workbook and return a line describing where it went.
 
@@ -343,7 +359,8 @@ def _write_slate_workbook(
         config.OUTPUT_DIR / f"slate_{season}_wk{week:02d}.xlsx"
     )
     export_slate_workbook(
-        path, slate=enriched, ratings=engine.current_ratings(), meta=meta, props=props
+        path, slate=enriched, ratings=engine.current_ratings(), meta=meta,
+        props=props, scorecard=scorecard,
     )
     return f"Workbook written to {path}"
 
@@ -443,7 +460,7 @@ def cmd_export(args) -> int:
     _, features = _build(args)
 
     season, week = _target_slate(features, args)
-    slate_out, predictor, totals, history, splits, props = _predict_slate(
+    slate_out, predictor, totals, history, splits, props, scorecard = _predict_slate(
         features, season, week, args
     )
 
@@ -483,13 +500,47 @@ def cmd_export(args) -> int:
     )
     export_workbook(
         path, slate=slate_out, ratings=ratings, result=result,
-        meta=meta, props=props,
+        meta=meta, props=props, scorecard=scorecard,
     )
     print(f"Workbook written to {path}")
     print(
-        f"  12 sheets | {len(slate_out)} slate games | {len(ratings)} teams | "
+        f"  {getattr(export_workbook, 'sheet_count', 0)} sheets | "
+        f"{len(slate_out)} slate games | {len(ratings)} teams | "
         f"{len(result.predictions):,} backtested games"
     )
+    return 0
+
+
+def cmd_track(args) -> int:
+    """Grade every pick this season has already settled."""
+    _, features = _build(args)
+    season = int(
+        args.season or features[features["completed"]]["season"].max()
+    )
+    card = track_season(
+        features,
+        season,
+        use_market=not args.no_market,
+        market_blend=args.market_blend,
+        total_blend=args.total_blend,
+        use_qb_features=_qb_features_enabled(args),
+        quiet=args.quiet,
+    )
+    print(report.format_scorecard(card))
+
+    if args.csv and not card.games.empty:
+        columns = [
+            "game_id", "season", "week", "away_team", "home_team", "pick",
+            "pick_prob", "margin", "hit", "market_spread", "pred_margin",
+            "ats_win", "market_total", "model_total", "pred_total",
+            "actual_total", "ou_pick", "ou_win", "total_error",
+        ]
+        config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        path = config.OUTPUT_DIR / f"scorecard_{season}.csv"
+        card.games[[c for c in columns if c in card.games.columns]].to_csv(
+            path, index=False
+        )
+        print(f"\nPer-game results written to {path}")
     return 0
 
 
@@ -538,6 +589,10 @@ def _common_options() -> argparse.ArgumentParser:
             "model weight when blending with the posted total "
             f"(default: {config.DEFAULT_TOTAL_MARKET_BLEND})"
         ),
+    )
+    common.add_argument(
+        "--no-scorecard", action="store_true",
+        help="skip this season's running results",
     )
     common.add_argument(
         "--no-props", action="store_true",
@@ -617,6 +672,12 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--refit", choices=("week", "season"), default="season")
     export.add_argument("-o", "--output", help="output path (default: out/*.xlsx)")
     export.set_defaults(func=cmd_export)
+
+    track = subparsers.add_parser(
+        "track", parents=[common], help="grade this season's picks so far"
+    )
+    track.add_argument("--season", type=int, default=None)
+    track.set_defaults(func=cmd_track)
 
     update = subparsers.add_parser(
         "update", parents=[common], help="refresh cached data"

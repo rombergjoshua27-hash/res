@@ -908,6 +908,100 @@ def _build_props(sheet, props: pd.DataFrame, meta: dict, *, top: int = 30) -> No
     _set_widths(sheet, [26, 8, 7, 12, 16])
 
 
+def _build_scorecard(sheet, rec: Recorder, card, meta: dict) -> None:
+    """This season's live results, week by week, next to the long-run figures."""
+    season = getattr(card, "season", meta.get("slate_season", ""))
+    row = _write_title(
+        sheet,
+        f"{season} Season Scorecard",
+        "Every week graded using only games that had finished before that "
+        "slate kicked off -- the same call the tool would have made on the day.",
+    )
+
+    if card is None or card.games.empty:
+        _note(sheet, row, f"No settled games yet for {season}.")
+        _set_widths(sheet, [10, 10, 10, 10, 12, 12, 12])
+        return
+
+    _write_header(
+        sheet, row,
+        ["Week", "Games", "Right", "Accuracy", "ATS W-L", "O/U W-L", "Total error"],
+    )
+    first = row + 1
+    for offset, week in enumerate(card.by_week.itertuples(index=False)):
+        r = first + offset
+        _value(sheet, r, 1, int(week.week))
+        _value(sheet, r, 2, int(week.games))
+        _value(sheet, r, 3, float(week.correct), "0")
+        rec.formula(
+            sheet, r, 4, f'=IF($B{r}=0,"",$C{r}/$B{r})', float(week.accuracy), PCT
+        )
+        _value(
+            sheet, r, 5,
+            "-" if not week.ats_played
+            else f"{int(week.ats_wins)}-{int(week.ats_played - week.ats_wins)}",
+        )
+        _value(
+            sheet, r, 6,
+            "-" if not week.ou_played
+            else f"{int(week.ou_wins)}-{int(week.ou_played - week.ou_wins)}",
+        )
+        _value(sheet, r, 7, float(week.total_error), "0.00")
+
+    last = first + len(card.by_week)
+    summary = card.summary
+    _value(sheet, last, 1, "All", font=_BOLD)
+    _value(sheet, last, 2, int(summary["games"]), font=_BOLD)
+    _value(sheet, last, 3, float(summary["correct"]), "0", font=_BOLD)
+    rec.formula(
+        sheet, last, 4, f'=IF($B{last}=0,"",$C{last}/$B{last})',
+        float(summary["accuracy"]), PCT,
+    ).font = _BOLD
+    _value(
+        sheet, last, 5,
+        "-" if not summary["ats_played"]
+        else f"{int(summary['ats_wins'])}-"
+             f"{int(summary['ats_played'] - summary['ats_wins'])}",
+        font=_BOLD,
+    )
+    _value(
+        sheet, last, 6,
+        "-" if not summary["ou_played"]
+        else f"{int(summary['ou_wins'])}-"
+             f"{int(summary['ou_played'] - summary['ou_wins'])}",
+        font=_BOLD,
+    )
+    _value(sheet, last, 7, float(summary["total_mae"]), "0.00", font=_BOLD)
+
+    row = last + 2
+    sheet.cell(row=row, column=1, value="This season against the long run").font = _SECTION_FONT
+    row += 1
+    _write_header(sheet, row, ["Measure", "This season", "Long run (2008-2026)"])
+    row += 1
+    for label, value, benchmark, fmt in (
+        ("Straight up", summary["accuracy"], 0.6661, PCT),
+        ("Against the spread", summary["ats_rate"], 0.4960, PCT),
+        ("Over/under", summary["ou_rate"], 0.5077, PCT),
+        ("Brier score", summary["brier"], 0.2099, NUM4),
+        ("Total error (points)", summary["total_mae"], 10.460, "0.000"),
+    ):
+        _value(sheet, row, 1, label)
+        _value(sheet, row, 2, _num(value), fmt)
+        _value(sheet, row, 3, benchmark, fmt)
+        row += 1
+
+    _note(sheet, row + 1,
+          f"{int(summary['games'])} games is far too few to judge a model on. A "
+          "single season swings several points either side of the long-run figure "
+          "on noise alone -- a hot start is not evidence the model improved, and a "
+          "cold one is not evidence it broke.")
+    _note(sheet, row + 2,
+          "Nothing here is stored between runs: the scorecard is recomputed from "
+          "the game log every time, so it cannot drift out of step with a corrected "
+          "result the way a running tally would.")
+    _set_widths(sheet, [22, 12, 12, 12, 12, 12, 13])
+
+
 def _build_totals_backtest(sheet, rec: Recorder, last_row: int, derived: pd.DataFrame) -> None:
     """Totals accuracy and over/under record, as live formulas over the Game Log."""
     row = _write_title(
@@ -1028,6 +1122,7 @@ _READ_ME = [
     ("text", "Point Totals -- the same slate scored for points: the model's own total, the posted total, the blend of the two, and the over/under it implies."),
     ("text", "Team Totals -- each side's projected points and the first-half split, derived from the game total and the spread."),
     ("text", "Player Projections -- projected passing, rushing and receiving yards for the players expected to appear."),
+    ("text", "Season Scorecard -- how this season's picks have actually landed, week by week, against the long-run figures."),
     ("text", "Power Ratings -- every franchise's current Elo, and what it is worth in points."),
     ("text", "Backtest Summary -- the model measured against the market, against Elo alone, and against simply picking the home team."),
     ("text", "Calibration -- whether a stated 70% actually wins 70% of the time."),
@@ -1107,6 +1202,7 @@ SLATE_READ_ME = [
     ("text", "Point Totals -- the model's own total, the posted total, the blend of the two, and the over/under it implies."),
     ("text", "Team Totals -- each side's projected points and the first-half split, derived from the game total and the spread."),
     ("text", "Player Projections -- projected passing, rushing and receiving yards for the players expected to appear."),
+    ("text", "Season Scorecard -- how this season's picks have actually landed, week by week, against the long-run figures."),
     ("text", "Power Ratings -- every franchise's current Elo, and what it is worth in points."),
     ("blank", ""),
     ("head", "How accurate is it, honestly"),
@@ -1118,7 +1214,7 @@ SLATE_READ_ME = [
 
 def export_slate_workbook(
     path, *, slate: pd.DataFrame, ratings: pd.DataFrame, meta: dict,
-    props: pd.DataFrame | None = None,
+    props: pd.DataFrame | None = None, scorecard=None,
 ) -> Path:
     """Write the slate-only workbook: no backtest, so it takes a second.
 
@@ -1138,7 +1234,7 @@ def export_slate_workbook(
         name: workbook.create_sheet(name)
         for name in (
             "Read Me", "Predictions", "Point Totals", "Team Totals",
-            "Player Projections", "Power Ratings",
+            "Player Projections", "Season Scorecard", "Power Ratings",
         )
     }
 
@@ -1147,16 +1243,18 @@ def export_slate_workbook(
     _build_totals_slate(sheets["Point Totals"], rec, slate, meta)
     _build_team_totals(sheets["Team Totals"], rec, slate, meta)
     _build_props(sheets["Player Projections"], props, meta)
+    _build_scorecard(sheets["Season Scorecard"], rec, scorecard, meta)
     _build_ratings(sheets["Power Ratings"], rec, ratings)
 
     workbook.save(path)
     _inject_cached_values(path, rec)
+    export_slate_workbook.sheet_count = len(sheets)
     return path
 
 
 def export_workbook(
     path, *, slate: pd.DataFrame, ratings: pd.DataFrame, result, meta: dict,
-    props: pd.DataFrame | None = None,
+    props: pd.DataFrame | None = None, scorecard=None,
 ) -> Path:
     """Write the full multi-sheet workbook to ``path``."""
     path = Path(path)
@@ -1173,9 +1271,9 @@ def export_workbook(
         name: workbook.create_sheet(name)
         for name in (
             "Read Me", "Predictions", "Point Totals", "Team Totals",
-            "Player Projections", "Power Ratings", "Backtest Summary",
-            "Calibration", "Against the Spread", "Point Totals Backtest",
-            "Accuracy by Season", "Game Log",
+            "Player Projections", "Season Scorecard", "Power Ratings",
+            "Backtest Summary", "Calibration", "Against the Spread",
+            "Point Totals Backtest", "Accuracy by Season", "Game Log",
         )
     }
 
@@ -1195,6 +1293,7 @@ def export_workbook(
     _build_totals_slate(sheets["Point Totals"], rec, slate, meta)
     _build_team_totals(sheets["Team Totals"], rec, slate, meta)
     _build_props(sheets["Player Projections"], props, meta)
+    _build_scorecard(sheets["Season Scorecard"], rec, scorecard, meta)
     _build_ratings(sheets["Power Ratings"], rec, ratings)
     _build_summary(sheets["Backtest Summary"], rec, last_row, derived, meta)
     _build_calibration(sheets["Calibration"], rec, last_row, derived)
@@ -1204,4 +1303,5 @@ def export_workbook(
 
     workbook.save(path)
     _inject_cached_values(path, rec)
+    export_workbook.sheet_count = len(sheets)
     return path

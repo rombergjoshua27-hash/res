@@ -13,6 +13,7 @@ from . import config
 
 __all__ = [
     "format_slate", "format_totals", "format_splits", "format_props",
+    "format_scorecard",
     "format_backtest",
     "format_ratings", "HONESTY_NOTE", "TOTALS_NOTE", "SPLITS_NOTE",
 ]
@@ -260,6 +261,83 @@ def format_props(props: pd.DataFrame, *, top: int = 12) -> str:
 
     lines += [_RULE, "? marks a player listed on the injury report; his projection is",
               "scaled by how often that status actually plays.", "", PROPS_NOTE, _RULE]
+    return "\n".join(lines)
+
+
+def format_scorecard(card) -> str:
+    """Render how the model has actually done so far this season."""
+    if card.games.empty:
+        return f"No settled games yet for {card.season}."
+
+    summary = card.summary
+    lines = [
+        _RULE,
+        f"{card.season} SEASON SCORECARD  --  {summary['games']} games settled",
+        _RULE,
+        "Every week below was predicted using only games that had finished",
+        "before that slate kicked off -- the same call the tool would have made",
+        "on the morning of.",
+        "",
+    ]
+
+    header = (
+        f"{'WEEK':<6}{'GAMES':>7}{'RIGHT':>7}{'ACC':>8}"
+        f"{'ATS':>10}{'O/U':>10}{'TOT ERR':>9}"
+    )
+    lines += [header, "-" * len(header)]
+    for row in card.by_week.itertuples(index=False):
+        ats = (
+            "    -  " if not row.ats_played
+            else f"{int(row.ats_wins)}-{int(row.ats_played - row.ats_wins)}"
+        )
+        ou = (
+            "    -  " if not row.ou_played
+            else f"{int(row.ou_wins)}-{int(row.ou_played - row.ou_wins)}"
+        )
+        lines.append(
+            f"{int(row.week):<6}{int(row.games):>7}{row.correct:>7.0f}"
+            f"{_fmt_pct(row.accuracy, 7)}{ats:>10}{ou:>10}{row.total_error:>9.1f}"
+        )
+
+    lines += ["-" * len(header)]
+    ats_all = (
+        "    -  " if not summary["ats_played"]
+        else f"{int(summary['ats_wins'])}-"
+             f"{int(summary['ats_played'] - summary['ats_wins'])}"
+    )
+    ou_all = (
+        "    -  " if not summary["ou_played"]
+        else f"{int(summary['ou_wins'])}-"
+             f"{int(summary['ou_played'] - summary['ou_wins'])}"
+    )
+    lines.append(
+        f"{'ALL':<6}{summary['games']:>7}{summary['correct']:>7.0f}"
+        f"{_fmt_pct(summary['accuracy'], 7)}{ats_all:>10}{ou_all:>10}"
+        f"{summary['total_mae']:>9.1f}"
+    )
+
+    lines += [
+        "",
+        f"Brier {summary['brier']:.4f}   "
+        f"ATS {_fmt_pct(summary['ats_rate'], 5).strip()}   "
+        f"O/U {_fmt_pct(summary['ou_rate'], 5).strip()}   "
+        f"total error {summary['total_mae']:.2f} pts "
+        f"(closing total: {summary['market_total_mae']:.2f})",
+    ]
+
+    if summary["games"] < 100:
+        lines += [
+            "",
+            f"{summary['games']} games is far too few to judge a model on. The "
+            "long-run figures",
+            "are 66.6% straight up and 49.6% against the spread over 4,912 games; a "
+            "single",
+            "season swings several points either side of that on noise alone. A hot "
+            "start",
+            "is not evidence the model improved, and a cold one is not evidence it "
+            "broke.",
+        ]
+    lines.append(_RULE)
     return "\n".join(lines)
 
 

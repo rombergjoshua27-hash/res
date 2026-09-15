@@ -1,8 +1,9 @@
 # nflpredict
 
-An NFL game model that forecasts all three markets — **moneyline, spread and
-point total** — with a walk-forward backtest attached, so every accuracy
-number it reports can be checked rather than believed.
+An NFL forecasting model covering **moneylines, spreads, point totals, team
+totals, half lines and player props** — with a walk-forward backtest attached
+to every one of them, so each accuracy number it reports can be checked
+rather than believed.
 
 ```
 $ nflpredict predict
@@ -70,6 +71,25 @@ forecast missed by — not whether it landed on the right side of a line.
 | Market (closing total) | 4,912 | 10.466 | 13.279 | +0.587 |
 | Model alone, no market | 4,912 | 10.679 | 13.519 | +0.629 |
 
+### Team totals and half lines
+
+Derived from the game total and the spread rather than modelled separately —
+a team total is not free to disagree with them.
+
+| Projection | Games | Model MAE | Naive league average |
+|---|---:|---:|---:|
+| Home team total | 4,912 | **7.494** | 8.130 |
+| Away team total | 4,912 | **7.301** | 8.130 |
+| First-half total | 4,912 | **7.027** | 7.216 |
+| First-half margin | 4,912 | 8.350 | — |
+| Second-half total | 4,912 | 7.654 | — |
+
+Team totals carry real information. The first-half total barely beats
+guessing the league average, and the first-half side is picked correctly
+**60.7%** of the time against 66.6% for the full game. First halves are
+mostly noise, and the tool says so next to the number rather than in a
+footnote.
+
 *Walk-forward over 2008-2026: for every slate both models are fitted only on
 games that had already finished. Reproduce with `nflpredict backtest`.*
 
@@ -119,6 +139,28 @@ points of 50% for almost every game. That is not a bug to be tuned away.
 It is the blend correctly reporting that it cannot separate itself from the
 posted number.
 
+### Player props
+
+Passing, rushing and receiving yards per player. Measured for players with
+real involvement, against the two baselines that matter:
+
+| Projection | Games | Model | Player's own average | League average |
+|---|---:|---:|---:|---:|
+| Passing yards (10+ att) | 7,940 | **61.87** | 68.40 | 64.25 |
+| Rushing yards (5+ carries) | 14,599 | **24.28** | 26.06 | 27.01 |
+| Receiving yards (3+ targets) | 37,076 | **22.90** | 24.84 | 26.06 |
+
+A clear gain over a player's own recent form on all three, and over the
+positional average on rushing and receiving. On passing yards the league
+average is nearly as good, because starting quarterbacks cluster tightly —
+worth saying rather than burying. And a 60-yard miss on a passing projection
+is a wide miss in absolute terms, whatever it beats.
+
+**No over/under probability is offered for props.** Yardage is long-tailed,
+and a normal curve over it would understate how often a projection is badly
+wrong. A confident-looking percentage is the easiest thing here to fake and
+the hardest to justify, so there isn't one.
+
 ## Install
 
 ```bash
@@ -133,20 +175,23 @@ to ~60 KB per season of cached summaries; subsequent runs are instant. Pass
 ## Usage
 
 ```bash
-nflpredict predict                      # next unplayed slate: sides and totals
+nflpredict predict              # the upcoming slate, every market + a workbook
 nflpredict predict --season 2026 --week 5
-nflpredict predict --csv                # also write out/predictions_*.csv
+nflpredict predict --no-excel   # terminal only, skip the workbook
+nflpredict predict --csv        # also write out/predictions_*.csv
 
-nflpredict export                       # everything, as an Excel workbook
+nflpredict track                # how this season's picks have actually landed
+
+nflpredict export               # everything incl. the full backtest, as xlsx
 nflpredict export -o ~/week2.xlsx
 
-nflpredict backtest                     # reproduce the tables above
-nflpredict backtest --no-market         # both models on their own merits
-nflpredict backtest --refit week        # refit before every slate (slower)
+nflpredict backtest             # reproduce the tables above
+nflpredict backtest --no-market # the models on their own merits
+nflpredict backtest --refit week
 
-nflpredict ratings --top 10             # current Elo power ratings
-nflpredict evaluate --season 2025       # score one finished season
-nflpredict update                       # refresh cached data
+nflpredict ratings --top 10     # current Elo power ratings
+nflpredict evaluate --season 2025
+nflpredict update               # refresh cached data
 ```
 
 As a library:
@@ -154,10 +199,16 @@ As a library:
 ```python
 from nflpredict import load_games, load_team_game_epa, build_features
 from nflpredict import GamePredictor, TotalsPredictor
+from nflpredict.players import load_injuries, load_player_weeks
 
+seasons = range(2006, 2027)
 games = load_games()
-epa = load_team_game_epa(range(2006, 2027))
-features = build_features(games, epa)
+features = build_features(
+    games,
+    load_team_game_epa(seasons),
+    player_weeks=load_player_weeks(seasons),
+    injuries=load_injuries(seasons),
+)
 
 history = features[features.completed & (features.season < 2026)]
 slate = features[(features.season == 2026) & (features.week == 5)]
@@ -166,24 +217,32 @@ GamePredictor().fit(history).predict(slate)    # winner + spread
 TotalsPredictor().fit(history).predict(slate)  # point total + over/under
 ```
 
+`SplitPredictor` derives team totals and half lines from that pair, and
+`PropsPredictor` projects player yardage. `track_season(features, 2026)`
+returns the live scorecard.
+
 ## The Excel workbook
 
-`nflpredict export` writes a ten-sheet workbook — the format most people
-actually want to read a slate in, and the one that makes the model
-auditable by someone who never opens the code.
+`nflpredict predict` writes a **seven-sheet slate workbook in about five
+seconds**. `nflpredict export` writes the full thirteen-sheet version with
+all the backtest evidence behind it, which takes a few minutes because it
+replays nineteen seasons to get there.
 
-| Sheet | What it holds |
-|---|---|
-| Read Me | What everything means, and how accurate it honestly is |
-| Predictions | The slate: pick, win %, confidence, model spread vs. the line, **fair moneyline vs. the book's price, and EV per $1** |
-| Point Totals | The slate scored for points: model total, posted total, the blend, over/under and P(over) |
-| Power Ratings | Every franchise's Elo, in points |
-| Backtest Summary | Model vs. market vs. Elo vs. picking the home team |
-| Calibration | Whether a stated 70% wins 70% |
-| Against the Spread | ATS record at six edge thresholds |
-| Point Totals Backtest | MAE, RMSE and bias, plus the over/under record |
-| Accuracy by Season | Year-by-year out-of-sample results |
-| Game Log | Every backtested game, one row each |
+| Sheet | Slate | Full | What it holds |
+|---|:-:|:-:|---|
+| Read Me | ● | ● | What everything means, and how accurate it honestly is |
+| Predictions | ● | ● | Pick, win %, confidence, model spread vs. the line, **fair moneyline vs. the book's price, and EV per $1** |
+| Point Totals | ● | ● | Model total, posted total, the blend, over/under and P(over) |
+| Team Totals | ● | ● | Each side's points and the first-half split, as live formulas |
+| Player Projections | ● | ● | Projected passing, rushing and receiving yards |
+| Season Scorecard | ● | ● | How this season's picks have actually landed, week by week |
+| Power Ratings | ● | ● | Every franchise's Elo, in points |
+| Backtest Summary | | ● | Model vs. market vs. Elo vs. picking the home team |
+| Calibration | | ● | Whether a stated 70% wins 70% |
+| Against the Spread | | ● | ATS record at six edge thresholds |
+| Point Totals Backtest | | ● | MAE, RMSE and bias, plus the over/under record |
+| Accuracy by Season | | ● | Year-by-year out-of-sample results |
+| Game Log | | ● | Every backtested game, one row each |
 
 Every summary figure is a **live formula over the Game Log**, not a value
 pasted in by Python — so filtering the log re-scores the whole workbook, and
@@ -298,28 +357,26 @@ requiring every later season to be exactly untouched by its own games.
 
 Kept here because negative results are the useful half of a model's story.
 
-**A quarterback adjustment made it worse.** The intuition is sound — a
-backup starting is worth several points — but this implementation attributed
-whole-team offensive EPA to the starter, double-counting team strength that
-the Elo rating already carried:
-
-Measured market-free over 2008-2026, turning it on costs a point of accuracy
-and makes the probabilities worse on both proper scoring rules:
+**The first quarterback adjustment made it worse.** The intuition is sound —
+a backup starting is worth several points — but that implementation rated a
+passer by his team's offensive EPA, which is mostly a property of the team,
+and the team's strength was already in its Elo rating. It double-counted,
+then folded the result into Elo at a hand-picked scale:
 
 | Setting | Games | Accuracy | Brier | Log loss |
 |---|---:|---:|---:|---:|
-| No QB adjustment (default) | 4,912 | **65.1%** | **0.2186** | **0.6281** |
-| QB adjustment on | 4,912 | 64.1% | 0.2206 | 0.6325 |
+| No Elo QB term (default) | 4,912 | **65.1%** | **0.2186** | **0.6281** |
+| Elo QB term on | 4,912 | 64.1% | 0.2206 | 0.6325 |
 
 It degrades the Elo rating itself as much as the ensemble — Elo alone falls
-from 65.1% to 63.3% with the term switched on. A sweep across adjustment
-scales (15/25/45 Elo per EPA point, caps of 3-6 points) was worse at every
-setting; those figures are recorded in `config.py` against the range they
-were measured on.
+from 65.1% to 63.3% with the term switched on. A sweep across scales
+(15/25/45 Elo per EPA point, caps of 3-6 points) was worse at every setting.
+It stays reachable via `--qb-adjustment` so the experiment is reproducible.
 
-It is off by default and reachable via `--qb-adjustment` so the experiment
-stays reproducible. Doing it properly needs player-level data separating a
-passer from his supporting cast.
+The [second attempt](#quarterbacks-and-injuries) works, and the difference
+between them is the whole lesson: rate the passer with measures that isolate
+him, feed the model the *change* rather than the level, and let it fit the
+weight instead of choosing one.
 
 **Recency weighting made the totals model worse.** Scoring has drifted
 upward — 41.5 points per game in 2006 against ~45.5 today — so weighting
@@ -352,6 +409,11 @@ attached to the pick. That is a smaller claim than the raw correlations
 suggest, and it is smaller than this project originally reported, because
 Elo already encodes most of what team efficiency has to say.
 
+**Recency weighting for the passer rating was not tried, because recency
+weighting for totals already failed.** The same reasoning applies: centering
+features on a prior-seasons baseline absorbs the drift, and past that point
+more data beats fresher data.
+
 **Refitting every week instead of every season is not worth the compute.**
 `--refit week` refits before each of the ~320 slates rather than once per
 season, roughly 19x the fits, and a prior measurement put the accuracy
@@ -364,6 +426,71 @@ win rate on picks where the model disagrees with the spread by 3+ points —
 on 23 bets. That is a sample of 23. The tool prints the warning next to the
 number because this is exactly the trap that sells betting systems.
 
+## Quarterbacks and injuries
+
+The model knows who is starting and who is hurt. Three things make this
+version work where the [first attempt](#what-didnt-work) failed:
+
+1. **Passer-isolating inputs.** Completion percentage over expected is
+   computed per throw against the difficulty of that throw, and EPA is taken
+   per *dropback* — sacks counted as the failed dropbacks they are — rather
+   than per team play. Neither is a restatement of team strength.
+2. **A difference, not a level.** The feature is not "how good is this
+   quarterback", which Elo roughly knows already. It is how far this week's
+   starter sits from the one the team has been playing. Same starter reads
+   ≈0, so there is nothing to double-count.
+3. **A learned weight.** The terms enter the feature matrix and the model
+   fits their coefficients alongside `elo_diff`, instead of being told how
+   many points a quarterback is worth.
+
+Availability works the same way: the injury report becomes the share of a
+team's recent receiving and rushing workload expected to be missing, and the
+model decides what that is worth. The play rates behind it are measured, not
+assumed — joining each week's report to the box score that followed, over
+73,243 report rows from 2009-2026:
+
+| Listed status | Rows | Plays (normalised) |
+|---|---:|---:|
+| Out | 16,098 | 0.00 |
+| Doubtful | 3,385 | 0.01 |
+| Questionable | 23,574 | 0.69 |
+
+"Doubtful" really does mean it. "Questionable" is the only status where the
+number does real work.
+
+**What it buys:**
+
+| | Accuracy | Brier | Log loss |
+|---|---:|---:|---:|
+| Market off, base | 65.07% | 0.2186 | 0.6281 |
+| Market off, **+ QB/injury** | 64.98% | **0.2171** | **0.6247** |
+| Market on, base | 66.61% | 0.2099 | 0.6087 |
+| Market on, + QB/injury | 66.59% | 0.2099 | 0.6085 |
+
+Unchanged accuracy, significantly better probabilities market-free
+(p=0.002 on a paired test of per-game Brier; on the 280 games where the two
+disagreed on the pick it was 138-142, a dead heat).
+
+**With the market on it is a wash** — 13 of 4,912 picks moved. The closing
+line already prices a backup quarterback and a Friday injury report. It is
+on by default because the market-free path is the one that matters when no
+line is posted; `--no-qb-features` turns it off.
+
+## Tracking the season
+
+```bash
+nflpredict track
+```
+
+Every week is graded using only the games that had finished before that
+slate kicked off — the same call the tool would have made on the morning of,
+not a tidied-up version of it. Nothing is stored between runs: the scorecard
+is recomputed from the game log each time, so it cannot drift out of step
+with a corrected result the way a running tally would.
+
+The output carries its own health warning, because a season is a small
+sample and a hot start is not evidence the model improved.
+
 ## Data
 
 Everything comes from [nflverse](https://github.com/nflverse), free and
@@ -373,7 +500,17 @@ public, no API key:
   moneylines, rest days, venue, roof, temperature, wind, starters, back to
   1999.
 - **Play-by-play** — `nflverse/nflverse-data`: ~50k plays per season with
-  EPA, win probability, drive identifiers and success flags.
+  EPA, win probability, drive identifiers and success flags. Also the source
+  of halftime scores.
+- **Player box scores** — `nflverse-data/stats_player`: per player per game
+  since 1999, with CPOE, EPA, target share and air-yards share.
+- **Injury reports** — `nflverse-data/injuries`: the weekly report since
+  2009, with game status and practice participation.
+
+Snap counts are deliberately *not* used: nflverse keys them by Pro Football
+Reference id rather than the gsis id everything else uses, so joining them
+means matching on names — fragile, and unnecessary when `target_share` and
+`wopr` already measure usage on a clean key.
 
 Cached under `data/` (gitignored). `nflpredict update` refreshes.
 
@@ -381,22 +518,27 @@ Cached under `data/` (gitignored). `nflpredict update` refreshes.
 
 ```bash
 pip install -e . && pip install pytest
-pytest -q        # 101 tests
+pytest -q        # 160 tests
 ```
 
-Layout: `data.py` fetch/cache · `elo.py` ratings · `features.py` leak-free
-matrix · `model.py` winner/spread ensemble + blend · `totals.py` point
-totals · `backtest.py` walk-forward + metrics · `edge.py` EV, fair odds and
-Kelly · `report.py` formatting · `excel.py` workbook · `cli.py` commands.
+Layout: `data.py` fetch/cache · `players.py` player box scores and injuries ·
+`elo.py` ratings · `features.py` leak-free matrix · `model.py` winner/spread
+ensemble + blend · `totals.py` point totals · `qb.py` passer value and
+availability · `splits.py` team totals and half lines · `props.py` player
+projections · `backtest.py` walk-forward, metrics and season tracking ·
+`edge.py` EV, fair odds and Kelly · `report.py` formatting · `excel.py`
+workbooks · `cli.py` commands.
 
 ## Using this responsibly
 
 It is a forecasting and analysis tool: power ratings, calibrated
-probabilities, point-total projections, and an honest measure of how much of
-the game is actually predictable. That is what it is good for.
+probabilities, point and player projections, and an honest measure of how
+much of the game is actually predictable. That is what it is good for.
 
 If anyone points it at a sportsbook anyway, the backtest is unambiguous — it
-loses at -110 on sides *and* on totals, and the `edge.py` Kelly sizing is
+loses at -110 on sides *and* on totals, the first-half numbers are weaker
+still, and the player projections carry no probability at all because the
+distributions do not support one. The `edge.py` Kelly sizing is
 quarter-Kelly precisely because a Brier score of 0.21 means the
 probabilities are good but not sharp enough to bet aggressively on. The
 `EV / $1` column in the workbook is negative on every game of a typical
