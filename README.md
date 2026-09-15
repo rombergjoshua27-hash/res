@@ -504,15 +504,34 @@ quarterbacks and the injury report all move during a week; seasons that have
 finished do not, and re-fetching twenty of them daily would be twenty minutes
 of downloading to discover nothing had happened.
 
-**It also runs itself.** `.github/workflows/refresh.yml` rebuilds the
-workbook every morning at 11:00 UTC and publishes it two ways: as an artifact
-on the run, and as an asset on a `latest` release, so there is always a
-stable URL pointing at the newest build. It can also be triggered by hand
-from the Actions tab, optionally for a specific week.
+**It also runs itself**, so week to week there is nothing to do.
 
-The schedule rolls the slate forward on its own — once a week is mostly
-played, the model starts predicting the next one — so nothing needs asking
-for again.
+`.github/workflows/refresh.yml` rebuilds the workbook every morning at 11:00
+UTC and publishes it two ways:
+
+- **[nflpredict-latest.xlsx](../../releases/download/latest/nflpredict-latest.xlsx)**
+  on the `latest` release — a fixed filename, so this link always serves the
+  newest build and is safe to bookmark.
+- An artifact on each run, named for the week it covers, kept 90 days.
+
+To pull a week early, or rebuild a specific one: Actions → *Refresh workbook*
+→ *Run workflow*, optionally with a season and week. Locally, `nflpredict
+refresh` does the same thing.
+
+### What changes through a week
+
+Nothing needs asking for again, because every part of the week arrives on its
+own schedule:
+
+| When | What the rebuild picks up |
+|---|---|
+| Mon–Tue | Last week's results. The Season Scorecard grades every pick, and the slate rolls forward once a week is mostly played. |
+| Wed–Fri | Injury reports publish, so the availability term stops reading "nobody is hurt" and player projections get scaled by who is actually expected to play. |
+| Sat–Sun | Lines and listed starters firm up, which is most of what moves a number. |
+
+The backtest grows with the season too: each finished game becomes another
+row behind the accuracy figures, and the walk-forward cache notices and
+recomputes.
 
 The walk-forward backtest is cached and keyed on everything that could change
 its answer: completed games, seasons, blend weights, and whether the passer
