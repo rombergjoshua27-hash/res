@@ -19,7 +19,11 @@ import pandas as pd
 from . import config
 from .elo import EloEngine
 
-__all__ = ["build_features", "FEATURE_COLUMNS", "MARKET_COLUMNS", "TEAM_STATS"]
+__all__ = [
+    "build_features", "FEATURE_COLUMNS", "TOTAL_FEATURE_COLUMNS",
+    "MARKET_COLUMNS", "MARKET_TOTAL_COLUMNS", "TEAM_STATS", "TOTALS_STATS",
+    "ROLLED_STATS",
+]
 
 
 # Raw per-game team statistics that get rolled forward into "form".
@@ -29,6 +33,21 @@ TEAM_STATS: List[str] = [
     "def_epa_play", "def_pass_epa", "def_rush_epa", "def_success",
     "def_explosive", "def_turnover_rate", "def_sack_rate",
 ]
+
+# Rolled forward by the same machinery, but consumed only by the totals
+# model. Kept in a separate list so the win model's validated feature set is
+# untouched by anything added for scoring.
+#
+# Points come from the game log rather than play-by-play, so they are
+# available for every season; possessions and pace come from play-by-play.
+TOTALS_STATS: List[str] = [
+    "points_for", "points_against",
+    "off_plays", "off_drives", "off_plays_per_drive", "off_pass_rate",
+    "def_plays", "def_drives", "def_plays_per_drive", "def_pass_rate",
+]
+
+# Everything the rolling pass produces, in one list.
+ROLLED_STATS: List[str] = TEAM_STATS + TOTALS_STATS
 
 # Model inputs that never touch a betting market.
 FEATURE_COLUMNS: List[str] = [
@@ -47,9 +66,30 @@ FEATURE_COLUMNS: List[str] = [
     "form_confidence",
 ]
 
+# Inputs to the totals model. Like the win model these never touch a
+# betting market -- the posted total is blended in afterwards.
+TOTAL_FEATURE_COLUMNS: List[str] = [
+    "scoring_sum",        # both offences' recent scoring, both defences' leakiness
+    "off_epa_sum",        # combined offensive efficiency
+    "def_epa_sum",        # combined defensive generosity
+    "explosive_sum",      # big plays create points quickly
+    "turnover_sum",       # giveaways shorten fields and add possessions
+    "plays_sum",          # combined expected snaps
+    "drives_sum",         # combined expected possessions
+    "plays_per_drive_sum",
+    "pass_rate_sum",      # pass-heavy games stop the clock and run longer
+    "wind_speed",
+    "temperature",
+    "is_indoor",
+    "div_game",
+    "is_playoff",
+    "form_confidence",
+]
+
 # Market-derived inputs, kept separate so the model can be run with or
 # without them (`--no-market` isolates genuine model edge).
 MARKET_COLUMNS: List[str] = ["market_spread"]
+MARKET_TOTAL_COLUMNS: List[str] = ["market_total"]
 
 
 # --------------------------------------------------------------------------
@@ -57,28 +97,49 @@ MARKET_COLUMNS: List[str] = ["market_spread"]
 # --------------------------------------------------------------------------
 
 
-def _league_baselines(team_games: pd.DataFrame) -> pd.DataFrame:
+def _league_baselines(team_games: pd.DataFrame, stats: Sequence[str]) -> pd.DataFrame:
     """Mean of each stat over all seasons *strictly before* each season.
 
-    Centering on a prior-seasons-only baseline removes era drift (offensive
-    efficiency has risen steadily) without letting the current season inform
-    its own normalization.
+    Centering on a prior-seasons-only baseline removes era drift -- offensive
+    efficiency and scoring have both risen steadily -- without letting the
+    current season inform its own normalization.
+
+    Sums and counts are accumulated per statistic rather than per row,
+    because availability differs by column: points come from the game log and
+    exist for every season, while possessions and efficiency come from
+    play-by-play and only exist once it has been loaded.
+
+    ONE DOCUMENTED EXCEPTION. The first season in which a statistic appears
+    has no earlier season to centre on, so it is centred on its own mean.
+    That single season's baseline therefore contains a trace of its own
+    games -- roughly one part in five hundred per game, spread across a
+    league-wide average. Every later season is strictly prior-only, which
+    ``tests/test_leakage.py`` asserts directly.
+
+    The exception is contained rather than tolerated: the first season of
+    loaded data is a warm-up season that the backtest never scores. The
+    defaults leave eight seasons between the two (play-by-play from 2006,
+    scoring from 2007), and ``cli`` refuses a ``--start`` that would reach
+    back into the warm-up season.
     """
-    seasonal = team_games.groupby("season")[TEAM_STATS].mean()
-    counts = team_games.groupby("season").size()
+    stats = list(stats)
+    sums = team_games.groupby("season")[stats].sum(min_count=1)
+    counts = team_games.groupby("season")[stats].count().astype(float)
 
     baselines = {}
-    running_sum = pd.Series(0.0, index=TEAM_STATS)
-    running_n = 0.0
-    for season in sorted(seasonal.index):
-        if running_n > 0:
-            baselines[season] = running_sum / running_n
-        else:
-            baselines[season] = seasonal.loc[season]  # first season: self
-        running_sum = running_sum + seasonal.loc[season] * counts.loc[season]
-        running_n += counts.loc[season]
+    running_sum = pd.Series(0.0, index=stats)
+    running_n = pd.Series(0.0, index=stats)
+    for season in sorted(sums.index):
+        season_sum = sums.loc[season].fillna(0.0)
+        season_n = counts.loc[season]
+        prior_mean = running_sum / running_n.replace(0.0, np.nan)
+        own_mean = season_sum / season_n.replace(0.0, np.nan)
+        # No prior history for this stat yet -> centre it on its own season.
+        baselines[season] = prior_mean.where(running_n > 0, own_mean)
+        running_sum = running_sum + season_sum
+        running_n = running_n + season_n
 
-    return pd.DataFrame(baselines).T.reindex(columns=TEAM_STATS)
+    return pd.DataFrame(baselines).T.reindex(columns=stats)
 
 
 # --------------------------------------------------------------------------
@@ -161,33 +222,40 @@ def _roll_one_team(
 
 def _build_team_form(games: pd.DataFrame, team_epa: pd.DataFrame) -> pd.DataFrame:
     """Return one row per (game_id, team) carrying that team's pregame form."""
-    home = games[["game_id", "season", "week", "kickoff", "home_team"]].rename(
-        columns={"home_team": "team"}
+    base = ["game_id", "season", "week", "kickoff"]
+    home = games[base + ["home_team", "home_score", "away_score"]].rename(
+        columns={
+            "home_team": "team",
+            "home_score": "points_for",
+            "away_score": "points_against",
+        }
     )
-    away = games[["game_id", "season", "week", "kickoff", "away_team"]].rename(
-        columns={"away_team": "team"}
+    away = games[base + ["away_team", "away_score", "home_score"]].rename(
+        columns={
+            "away_team": "team",
+            "away_score": "points_for",
+            "home_score": "points_against",
+        }
     )
     long = pd.concat([home, away], ignore_index=True)
 
-    stats_available = [s for s in TEAM_STATS if s in team_epa.columns]
-    if team_epa.empty or not stats_available:
-        long[TEAM_STATS] = np.nan
-        long["form_games"] = 0.0
-        return long
-
-    long = long.merge(
-        team_epa[["game_id", "team"] + stats_available],
-        on=["game_id", "team"],
-        how="left",
-    )
-    for missing in set(TEAM_STATS) - set(stats_available):
+    # Points come from the game log, so they are present whether or not
+    # play-by-play has been loaded. Everything else needs the EPA cache.
+    epa_stats = [s for s in ROLLED_STATS if s not in ("points_for", "points_against")]
+    stats_available = [s for s in epa_stats if s in team_epa.columns]
+    if not team_epa.empty and stats_available:
+        long = long.merge(
+            team_epa[["game_id", "team"] + stats_available],
+            on=["game_id", "team"],
+            how="left",
+        )
+    for missing in set(epa_stats) - set(stats_available):
         long[missing] = np.nan
 
     # Center on prior-seasons-only league means so 0 == league average.
-    observed = long.dropna(subset=["off_epa_play"])
-    baselines = _league_baselines(observed)
+    baselines = _league_baselines(long, ROLLED_STATS)
     centered = long.copy()
-    for stat in TEAM_STATS:
+    for stat in ROLLED_STATS:
         offsets = centered["season"].map(baselines[stat])
         centered[stat] = centered[stat] - offsets.astype(float)
 
@@ -197,7 +265,7 @@ def _build_team_form(games: pd.DataFrame, team_epa: pd.DataFrame) -> pd.DataFram
     rolled = centered.groupby("team", group_keys=False, sort=False).apply(
         lambda frame: _roll_one_team(
             frame,
-            TEAM_STATS,
+            ROLLED_STATS,
             alpha=config.EPA_EWMA_ALPHA,
             carry=config.EPA_PRIOR_SEASON_CARRY,
             blend_full=config.EPA_BLEND_FULL_GAMES,
@@ -288,10 +356,69 @@ def build_features(
         out[["home_form_games", "away_form_games"]].min(axis=1).fillna(0.0), 8.0
     )
 
+    _attach_totals_features(out)
+
     out["market_spread"] = out["spread_line"].astype(float)
     out["has_market"] = out["market_spread"].notna().astype(float)
+    out["market_total"] = out["total_line"].astype(float)
+    out["has_market_total"] = out["market_total"].notna().astype(float)
 
-    for column in FEATURE_COLUMNS:
+    for column in FEATURE_COLUMNS + TOTAL_FEATURE_COLUMNS:
         out[column] = pd.to_numeric(out[column], errors="coerce").fillna(0.0)
 
     return out
+
+
+# --------------------------------------------------------------------------
+# Totals features
+# --------------------------------------------------------------------------
+
+# Indoors there is no wind and the thermostat sits in the 60s-70s, so a
+# closed roof is encoded as calm and mild rather than as missing weather.
+INDOOR_ROOFS = ("dome", "closed")
+INDOOR_TEMPERATURE_F = 70.0
+
+
+def _attach_totals_features(out: pd.DataFrame) -> None:
+    """Add the combined-scoring features the totals model consumes, in place.
+
+    Every term is a *sum* across the two teams rather than a difference. A
+    total does not care who is better -- two good offences and two bad ones
+    both push the number up, so the sides add.
+    """
+
+    def pair(stat: str) -> pd.Series:
+        """Both teams' rolling value for ``stat``, added together."""
+        return out[f"home_{stat}"].fillna(0.0) + out[f"away_{stat}"].fillna(0.0)
+
+    # Recent scoring, counting both what each side puts up and what each side
+    # gives up -- averaged so the scale stays in points-per-team-game.
+    out["scoring_sum"] = (
+        pair("points_for") + pair("points_against")
+    ) / 2.0
+
+    out["off_epa_sum"] = pair("off_epa_play")
+    # A high def_* value means a generous defence, so this also adds.
+    out["def_epa_sum"] = pair("def_epa_play")
+    out["explosive_sum"] = pair("off_explosive") + pair("def_explosive")
+    out["turnover_sum"] = pair("off_turnover_rate") + pair("def_turnover_rate")
+    out["plays_sum"] = pair("off_plays") + pair("def_plays")
+    out["drives_sum"] = pair("off_drives") + pair("def_drives")
+    out["plays_per_drive_sum"] = pair("off_plays_per_drive") + pair("def_plays_per_drive")
+    out["pass_rate_sum"] = pair("off_pass_rate") + pair("def_pass_rate")
+
+    roof = out.get("roof", pd.Series("outdoors", index=out.index)).astype(str)
+    indoor = roof.isin(INDOOR_ROOFS)
+    out["is_indoor"] = indoor.astype(float)
+
+    wind = pd.to_numeric(out.get("wind"), errors="coerce")
+    temp = pd.to_numeric(out.get("temp"), errors="coerce")
+    # Indoors the reading is absent because it does not apply, not because it
+    # is unknown; outdoors an absent reading falls back to a mild, calm day so
+    # a missing value never reads as a storm.
+    out["wind_speed"] = wind.where(~indoor, 0.0).fillna(0.0).clip(0.0, 35.0)
+    out["temperature"] = (
+        temp.where(~indoor, INDOOR_TEMPERATURE_F)
+        .fillna(INDOOR_TEMPERATURE_F)
+        .clip(-10.0, 110.0)
+    )

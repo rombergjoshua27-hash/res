@@ -25,6 +25,7 @@ from .edge import attach_edges
 from .elo import EloEngine
 from .features import build_features
 from .model import GamePredictor
+from .totals import TotalsPredictor
 
 __all__ = ["main"]
 
@@ -51,8 +52,12 @@ def _build(args) -> Tuple[pd.DataFrame, pd.DataFrame]:
 def _target_slate(features: pd.DataFrame, args) -> Tuple[int, int]:
     """Resolve which (season, week) to predict.
 
-    Defaults to the earliest slate that still has an unplayed game -- i.e.
-    the games that actually need predicting.
+    Defaults to the earliest slate that still has an unplayed game, with one
+    refinement: a week whose games have mostly been played is not the
+    upcoming slate. On a Monday, week N has a single night game left and week
+    N+1 is what actually needs predicting, so the default rolls forward and
+    the finished results feed the fit instead. ``--week`` still reaches the
+    straggler.
     """
     if args.season and args.week:
         return int(args.season), int(args.week)
@@ -66,23 +71,57 @@ def _target_slate(features: pd.DataFrame, args) -> Tuple[int, int]:
         return int(last["season"]), int(last["week"])
 
     first = pending.sort_values(["season", "week"]).iloc[0]
-    return int(first["season"]), int(first["week"])
+    season, week = int(first["season"]), int(first["week"])
+
+    slate = features[(features["season"] == season) & (features["week"] == week)]
+    if slate["completed"].mean() >= 0.5:
+        later = pending[
+            (pending["season"] > season)
+            | ((pending["season"] == season) & (pending["week"] > week))
+        ]
+        if not later.empty:
+            nxt = later.sort_values(["season", "week"]).iloc[0]
+            season, week = int(nxt["season"]), int(nxt["week"])
+    return season, week
 
 
-def _fit_through(features: pd.DataFrame, season: int, week: int, args) -> GamePredictor:
-    """Fit on every completed game strictly before the target slate."""
-    period = season * 100 + week
-    history = features[
-        (features["season"] * 100 + features["week"] < period) & features["completed"]
-    ]
+def _training_history(features: pd.DataFrame, season: int, week: int) -> pd.DataFrame:
+    """Every game that had finished before the target slate kicks off.
+
+    The cutoff is the slate's first kickoff rather than its week number, so a
+    midweek run picks up results already on the board -- predicting week 2 on
+    a Monday trains on week 1's Sunday games, which a week-number cutoff
+    would throw away. All games in the slate share one cutoff, so no game in
+    it is fitted on a different information set than its neighbours.
+    """
+    slate = features[(features["season"] == season) & (features["week"] == week)]
+    completed = features[features["completed"]]
+
+    kickoff = slate["kickoff"].min() if not slate.empty else pd.NaT
+    if pd.isna(kickoff):
+        period = season * 100 + week
+        return completed[completed["season"] * 100 + completed["week"] < period]
+    return completed[completed["kickoff"] < kickoff]
+
+
+def _fit_through(
+    features: pd.DataFrame, season: int, week: int, args
+) -> Tuple[GamePredictor, TotalsPredictor, pd.DataFrame]:
+    """Fit the winner/spread model and the totals model on the same history."""
+    history = _training_history(features, season, week)
     if len(history) < 200:
         raise SystemExit(
             f"only {len(history)} completed games before {season} week {week}; "
             "not enough history to fit"
         )
-    return GamePredictor(
+    winner = GamePredictor(
         use_market=not args.no_market, market_blend=args.market_blend
     ).fit(history)
+    totals = TotalsPredictor(
+        use_market=not args.no_market,
+        market_blend=getattr(args, "total_blend", config.DEFAULT_TOTAL_MARKET_BLEND),
+    ).fit(history)
+    return winner, totals, history
 
 
 # --------------------------------------------------------------------------
@@ -90,41 +129,67 @@ def _fit_through(features: pd.DataFrame, season: int, week: int, args) -> GamePr
 # --------------------------------------------------------------------------
 
 
-def cmd_predict(args) -> int:
-    _, features = _build(args)
-    season, week = _target_slate(features, args)
-    predictor = _fit_through(features, season, week, args)
+def _predict_slate(features: pd.DataFrame, season: int, week: int, args):
+    """Fit both models through the slate's kickoff and score every game in it.
+
+    Returns the enriched slate plus the two fitted predictors, so callers can
+    report what the fit actually saw.
+    """
+    winner, totals, history = _fit_through(features, season, week, args)
 
     slate = features[
         (features["season"] == season) & (features["week"] == week)
     ].copy()
     if slate.empty:
-        print(f"No games scheduled for {season} week {week}.", file=sys.stderr)
-        return 1
+        raise SystemExit(f"No games scheduled for {season} week {week}.")
 
-    predictions = predictor.predict(slate)
-    merged = slate.merge(
-        predictions.drop(columns=["game_id"]).assign(
+    def _attach(frame: pd.DataFrame, predictions: pd.DataFrame) -> pd.DataFrame:
+        """Merge predictions onto the slate, letting them win any name clash.
+
+        A predictor may re-emit a column the feature frame already carries
+        (``market_total`` is both an input and an output). Dropping the
+        feature-side copy first keeps one authoritative column instead of a
+        silently suffixed ``_x``/``_y`` pair.
+        """
+        payload = predictions.drop(columns=["game_id"]).assign(
             game_id=predictions["game_id"].values
-        ),
-        on="game_id",
-        how="left",
-    )
+        )
+        clashes = [
+            c for c in payload.columns if c != "game_id" and c in frame.columns
+        ]
+        return frame.drop(columns=clashes).merge(payload, on="game_id", how="left")
+
+    merged = _attach(slate, winner.predict(slate))
+    merged = _attach(merged, totals.predict(slate))
+    merged["actual_total"] = TotalsPredictor.actual_total(merged)
+
     enriched = attach_edges(merged).sort_values("pick_prob", ascending=False)
+    return enriched, winner, totals, history
+
+
+def cmd_predict(args) -> int:
+    _, features = _build(args)
+    season, week = _target_slate(features, args)
+    enriched, predictor, totals, history = _predict_slate(features, season, week, args)
 
     priced = int(enriched["market_spread"].notna().sum())
     title = (
         f"{season} WEEK {week}  --  {len(enriched)} games  "
-        f"({priced} with a posted line, trained on {predictor.report.n_train:,} games)"
+        f"({priced} with a posted line, trained on {predictor.report.n_train:,} games"
+        f"{_history_note(history, season)})"
     )
     print(report.format_slate(enriched, title=title))
+    print()
+    print(report.format_totals(enriched, sigma=totals.report.sigma))
 
     if args.csv:
         columns = [
             "game_id", "season", "week", "away_team", "home_team", "pick",
             "pick_prob", "confidence", "prob_home", "model_prob_home",
             "market_prob_home", "pred_margin", "market_spread", "spread_edge",
-            "ats_pick", "ml_ev", "kelly",
+            "ats_pick", "fair_home_ml", "fair_away_ml", "ml_ev", "kelly",
+            "pred_total", "model_total", "market_total", "total_edge",
+            "prob_over", "ou_pick",
         ]
         config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         path = config.OUTPUT_DIR / f"predictions_{season}_wk{week:02d}.csv"
@@ -133,7 +198,38 @@ def cmd_predict(args) -> int:
     return 0
 
 
+def _history_note(history: pd.DataFrame, season: int) -> str:
+    """Note how much of the current season the fit already contains."""
+    if history.empty:
+        return ""
+    this_season = history[history["season"] == season]
+    if this_season.empty:
+        return ""
+    weeks = sorted(this_season["week"].unique())
+    span = f"wk {weeks[0]}" if len(weeks) == 1 else f"wks {weeks[0]}-{weeks[-1]}"
+    return f", incl. {len(this_season)} from {season} {span}"
+
+
+def _guard_warmup_season(args) -> None:
+    """Refuse to score the first season of loaded play-by-play.
+
+    That season's league baselines are centred on themselves, because there
+    is no earlier season to centre on (see ``features._league_baselines``).
+    It is a warm-up season, not a scoreable one, and the defaults already
+    leave a gap. Only a hand-picked ``--epa-start`` can close it.
+    """
+    if args.no_epa or args.start is None:
+        return
+    if args.start <= args.epa_start:
+        raise SystemExit(
+            f"--start {args.start} would score {args.epa_start}, the first season "
+            f"of play-by-play, whose league baselines are centred on themselves. "
+            f"Use --start {args.epa_start + 1} or later, or move --epa-start back."
+        )
+
+
 def cmd_backtest(args) -> int:
+    _guard_warmup_season(args)
     _, features = _build(args)
     result = walk_forward(
         features,
@@ -141,6 +237,7 @@ def cmd_backtest(args) -> int:
         end_season=args.end,
         use_market=not args.no_market,
         market_blend=args.market_blend,
+        total_blend=args.total_blend,
         refit=args.refit,
         quiet=args.quiet,
     )
@@ -175,6 +272,7 @@ def cmd_evaluate(args) -> int:
         end_season=season,
         use_market=not args.no_market,
         market_blend=args.market_blend,
+        total_blend=args.total_blend,
         refit=args.refit,
         quiet=args.quiet,
     )
@@ -186,22 +284,14 @@ def cmd_export(args) -> int:
     """Write every model output to a multi-sheet Excel workbook."""
     from datetime import datetime
 
+    _guard_warmup_season(args)
+
     from .excel import export_workbook
 
     _, features = _build(args)
 
     season, week = _target_slate(features, args)
-    predictor = _fit_through(features, season, week, args)
-    slate = features[(features["season"] == season) & (features["week"] == week)].copy()
-    predictions = predictor.predict(slate)
-    merged = slate.merge(
-        predictions.drop(columns=["game_id"]).assign(
-            game_id=predictions["game_id"].values
-        ),
-        on="game_id",
-        how="left",
-    )
-    slate_out = attach_edges(merged).sort_values("pick_prob", ascending=False)
+    slate_out, predictor, totals, history = _predict_slate(features, season, week, args)
 
     engine = EloEngine(use_qb=args.qb_adjustment)
     engine.run(load_games(quiet=args.quiet))
@@ -215,6 +305,7 @@ def cmd_export(args) -> int:
         end_season=args.end,
         use_market=not args.no_market,
         market_blend=args.market_blend,
+        total_blend=args.total_blend,
         refit=args.refit,
         quiet=args.quiet,
     )
@@ -227,6 +318,9 @@ def cmd_export(args) -> int:
         "slate_week": week,
         "slate_train": predictor.report.n_train,
         "market_blend": args.market_blend,
+        "total_blend": args.total_blend,
+        "total_sigma": totals.report.sigma,
+        "slate_history_note": _history_note(history, season).lstrip(", "),
     }
 
     path = Path(args.output) if args.output else (
@@ -235,7 +329,7 @@ def cmd_export(args) -> int:
     export_workbook(path, slate=slate_out, ratings=ratings, result=result, meta=meta)
     print(f"Workbook written to {path}")
     print(
-        f"  8 sheets | {len(slate_out)} slate games | {len(ratings)} teams | "
+        f"  10 sheets | {len(slate_out)} slate games | {len(ratings)} teams | "
         f"{len(result.predictions):,} backtested games"
     )
     return 0
@@ -278,6 +372,13 @@ def _common_options() -> argparse.ArgumentParser:
         help=(
             "model weight when blending with the line "
             f"(default: {config.DEFAULT_MARKET_BLEND})"
+        ),
+    )
+    common.add_argument(
+        "--total-blend", type=float, default=config.DEFAULT_TOTAL_MARKET_BLEND,
+        help=(
+            "model weight when blending with the posted total "
+            f"(default: {config.DEFAULT_TOTAL_MARKET_BLEND})"
         ),
     )
     common.add_argument(

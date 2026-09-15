@@ -59,12 +59,26 @@ NUM4 = "0.0000"
 _GL = "'Game Log'"
 
 GAME_LOG_HEADERS = [
+    # Winner / spread: columns A-Y
     "game_id", "season", "week", "away_team", "home_team", "margin",
     "home_win", "prob_blended", "prob_model", "prob_market", "prob_elo",
     "pred_margin", "market_spread", "hit_blended", "hit_model", "hit_market",
     "hit_elo", "brier_blended", "brier_model", "brier_market", "brier_elo",
     "confidence", "spread_edge", "ats_result", "abs_edge",
+    # Point totals: columns Z-AH
+    "actual_total", "market_total", "model_total", "pred_total",
+    "err_total_blended", "err_total_model", "err_total_market",
+    "ou_edge", "ou_result",
+    "signed_total_blended", "signed_total_model", "signed_total_market",
 ]
+
+# Game Log columns the totals sheets point their formulas at.
+TOTAL_COLS = {
+    "actual": "Z", "market": "AA", "model": "AB", "blend": "AC",
+    "err_blend": "AD", "err_model": "AE", "err_market": "AF",
+    "edge": "AG", "result": "AH",
+    "signed_blend": "AI", "signed_model": "AJ", "signed_market": "AK",
+}
 
 
 # --------------------------------------------------------------------------
@@ -279,6 +293,34 @@ def _derive(frame: pd.DataFrame) -> pd.DataFrame:
     )
     out["ats_result"] = np.where(unplayable, "", graded)
     out["abs_edge"] = out["spread_edge"].abs()
+
+    for column in ("actual_total", "market_total", "model_total", "pred_total"):
+        if column not in out.columns:
+            out[column] = np.nan
+
+    for name, column in (
+        ("blended", "pred_total"), ("model", "model_total"), ("market", "market_total"),
+    ):
+        signed = out["actual_total"] - out[column]
+        out[f"err_total_{name}"] = signed.abs()
+        out[f"signed_total_{name}"] = signed
+
+    # Over/under is graded against the model's own number, matching
+    # ``backtest.ou_record``: the blend is mostly the posted total, so
+    # grading against it would be grading the line against itself.
+    out["ou_edge"] = out["model_total"] - out["market_total"]
+    diff = out["actual_total"] - out["market_total"]
+    took_over = out["ou_edge"] > 0
+    ou_graded = np.where(
+        took_over,
+        np.where(diff > 0, "W", np.where(diff == 0, "P", "L")),
+        np.where(diff < 0, "W", np.where(diff == 0, "P", "L")),
+    )
+    out["ou_result"] = np.where(
+        out["market_total"].isna() | out["actual_total"].isna() | out["ou_edge"].isna(),
+        "",
+        ou_graded,
+    )
     return out
 
 
@@ -345,8 +387,41 @@ def _build_game_log(sheet, rec: Recorder, frame: pd.DataFrame) -> int:
         )
         rec.formula(sheet, r, 25, f'=IF($W{r}="","",ABS($W{r}))', row.abs_edge, "0.0")
 
+        # --- point totals, columns Z-AH
+        _value(sheet, r, 26, _num(row.actual_total), "0")
+        _value(sheet, r, 27, _num(row.market_total), "0.0")
+        _value(sheet, r, 28, _num(row.model_total), "0.0")
+        _value(sheet, r, 29, _num(row.pred_total), "0.0")
+        for col, source, name in (
+            (30, "AC", "blended"), (31, "AB", "model"), (32, "AA", "market"),
+        ):
+            rec.formula(
+                sheet, r, col,
+                f'=IF(OR($Z{r}="",{source}{r}=""),"",ABS($Z{r}-{source}{r}))',
+                getattr(row, f"err_total_{name}"), "0.00",
+            )
+        rec.formula(
+            sheet, r, 33, f'=IF(OR($AA{r}="",$AB{r}=""),"",$AB{r}-$AA{r})',
+            row.ou_edge, "0.0",
+        )
+        rec.formula(
+            sheet, r, 34,
+            f'=IF(OR($Z{r}="",$AA{r}="",$AG{r}=""),"",'
+            f'IF($AG{r}>0,IF($Z{r}>$AA{r},"W",IF($Z{r}=$AA{r},"P","L")),'
+            f'IF($Z{r}<$AA{r},"W",IF($Z{r}=$AA{r},"P","L"))))',
+            row.ou_result,
+        )
+        for col, source, name in (
+            (35, "AC", "blended"), (36, "AB", "model"), (37, "AA", "market"),
+        ):
+            rec.formula(
+                sheet, r, col,
+                f'=IF(OR($Z{r}="",{source}{r}=""),"",$Z{r}-{source}{r})',
+                getattr(row, f"signed_total_{name}"), "0.00",
+            )
+
     last_row = len(derived) + 1
-    _set_widths(sheet, [18, 8, 6, 10, 10, 8, 10] + [12] * 6 + [11] * 12)
+    _set_widths(sheet, [18, 8, 6, 10, 10, 8, 10] + [12] * 6 + [11] * 12 + [12] * 12)
     sheet.freeze_panes = "B2"
     sheet.auto_filter.ref = f"A1:{get_column_letter(len(GAME_LOG_HEADERS))}{last_row}"
     return last_row, derived
@@ -541,7 +616,8 @@ def _build_predictions(sheet, rec: Recorder, slate: pd.DataFrame, meta: dict) ->
     _write_header(
         sheet, row,
         ["Away", "Home", "Pick", "Win %", "Confidence", "Model", "Line", "Edge",
-         "Market Win %", "P(home)", "P(home) mkt", "Actual", "Outcome"],
+         "Market Win %", "P(home)", "P(home) mkt", "Actual", "Outcome",
+         "Fair ML", "Book ML", "EV / $1"],
     )
 
     first = row + 1
@@ -587,13 +663,207 @@ def _build_predictions(sheet, rec: Recorder, slate: pd.DataFrame, meta: dict) ->
             outcome,
         )
 
+        # The model's own price on the side it picked, the book's price on the
+        # same side, and what a unit stake is worth at the book's number.
+        rec.formula(
+            sheet, r, 14, f"=-100*$D{r}/(1-$D{r})",
+            -100.0 * confidence / (1.0 - confidence) if confidence < 1.0 else None,
+            "+0;-0",
+        )
+        book_ml = _num(getattr(game, "pick_odds", None))
+        _value(sheet, r, 15, book_ml, "+0;-0")
+        payout = (
+            None if book_ml is None
+            else (book_ml / 100.0 if book_ml > 0 else 100.0 / abs(book_ml))
+        )
+        rec.formula(
+            sheet, r, 16,
+            f'=IF($O{r}="","",$D{r}*IF($O{r}>0,$O{r}/100,100/ABS($O{r}))-(1-$D{r}))',
+            None if payout is None else confidence * payout - (1.0 - confidence),
+            "+0.000;-0.000",
+        )
+
     last = first + len(slate)
     _note(sheet, last + 1, "Edge = Model minus Line. A positive edge favours the home side.")
     _note(sheet, last + 2,
           "Outcome fills in for games already played. Those remain out-of-sample: the "
           "model never trained on its own slate.")
-    _set_widths(sheet, [9, 9, 9, 10, 13, 9, 9, 9, 13, 11, 12, 9, 10])
+    _note(sheet, last + 3,
+          "Fair ML is the price the model's own probability implies, with no vig. "
+          "Book ML is what is actually posted on that side. EV is per $1 staked at "
+          "the book price -- negative almost everywhere, which is the vig working.")
+    _set_widths(sheet, [9, 9, 9, 10, 13, 9, 9, 9, 13, 11, 12, 9, 10, 10, 10, 10])
     sheet.freeze_panes = f"A{first}"
+
+
+def _build_totals_slate(sheet, rec: Recorder, slate: pd.DataFrame, meta: dict) -> None:
+    """Point-total forecast for the slate being predicted."""
+    blend = meta.get("total_blend", config.DEFAULT_TOTAL_MARKET_BLEND)
+    row = _write_title(
+        sheet,
+        f"{meta['slate_season']} Week {meta['slate_week']} Point Totals",
+        f"Model is the model's own number; Line is the posted total; Projection "
+        f"blends them at {blend:.0%} model. Edge is Model minus Line.",
+    )
+    _write_header(
+        sheet, row,
+        ["Away", "Home", "Pick", "Model", "Line", "Projection", "Edge",
+         "P(over)", "P(push)", "Confidence", "Actual", "Outcome"],
+    )
+
+    first = row + 1
+    for offset, game in enumerate(slate.itertuples(index=False)):
+        r = first + offset
+        line = _num(getattr(game, "market_total", None))
+        model_total = _num(getattr(game, "model_total", None))
+        projection = _num(getattr(game, "pred_total", None))
+        prob_over = _num(getattr(game, "prob_over", None))
+        actual = _num(getattr(game, "actual_total", None))
+
+        # A slate can reach this sheet with no totals attached at all (a
+        # caller that only ran the winner model), so every cell below has to
+        # read as blank rather than raise.
+        priced = line is not None and projection is not None
+        over = priced and projection > line
+
+        _value(sheet, r, 1, game.away_team)
+        _value(sheet, r, 2, game.home_team)
+        rec.formula(
+            sheet, r, 3, f'=IF(OR($E{r}="",$F{r}=""),"-",IF($F{r}>$E{r},"OVER","UNDER"))',
+            "OVER" if over else ("UNDER" if priced else "-"),
+        ).font = _BOLD
+        _value(sheet, r, 4, model_total, "0.0")
+        _value(sheet, r, 5, line, "0.0")
+        _value(sheet, r, 6, projection, "0.0")
+        rec.formula(
+            sheet, r, 7, f'=IF(OR($D{r}="",$E{r}=""),"",$D{r}-$E{r})',
+            None if (line is None or model_total is None) else model_total - line,
+            SPREAD,
+        )
+        _value(sheet, r, 8, prob_over, PCT)
+        _value(sheet, r, 9, _num(getattr(game, "prob_push", None)), PCT)
+        confidence = None if prob_over is None else (prob_over if over else 1 - prob_over)
+        rec.formula(
+            sheet, r, 10,
+            f'=IF($H{r}="","-",IF(MAX($H{r},1-$H{r})>=0.575,"LEAN","COINFLIP"))',
+            "-" if confidence is None else ("LEAN" if confidence >= 0.575 else "COINFLIP"),
+        )
+        _value(sheet, r, 11, actual, "0")
+        outcome = ""
+        if actual is not None and priced:
+            if actual == line:
+                outcome = "PUSH"
+            else:
+                outcome = "HIT" if (actual > line) == over else "MISS"
+        rec.formula(
+            sheet, r, 12,
+            f'=IF(OR($K{r}="",$E{r}=""),"",IF($K{r}=$E{r},"PUSH",'
+            f'IF(OR(AND($F{r}>$E{r},$K{r}>$E{r}),AND($F{r}<=$E{r},$K{r}<$E{r})),'
+            f'"HIT","MISS")))',
+            outcome,
+        )
+
+    last = first + len(slate)
+    _note(sheet, last + 1,
+          "Projection is what the model actually stands behind. Because the blend "
+          "keeps only a tenth of the model's disagreement, Edge is usually much "
+          "larger than Projection minus Line -- that gap is deliberate.")
+    _note(sheet, last + 2,
+          "Walk-forward over 2008-2026 the model missed the final total by 10.68 "
+          "points on average and the closing total by 10.47. Over/under picks hit "
+          "50.8%, below the 52.38% needed to break even at -110.")
+    _set_widths(sheet, [9, 9, 9, 9, 9, 12, 9, 10, 10, 13, 9, 10])
+    sheet.freeze_panes = f"A{first}"
+
+
+def _build_totals_backtest(sheet, rec: Recorder, last_row: int, derived: pd.DataFrame) -> None:
+    """Totals accuracy and over/under record, as live formulas over the Game Log."""
+    row = _write_title(
+        sheet,
+        "Point Totals -- Backtest",
+        "Every figure is a formula over the Game Log, so filtering that sheet "
+        "re-scores this one.",
+    )
+
+    _write_header(sheet, row, ["Method", "Games", "MAE", "RMSE", "Bias"])
+    methods = [
+        ("Model + market blend", TOTAL_COLS["err_blend"], TOTAL_COLS["signed_blend"], "blended"),
+        ("Model alone (no market)", TOTAL_COLS["err_model"], TOTAL_COLS["signed_model"], "model"),
+        ("Market (closing total)", TOTAL_COLS["err_market"], TOTAL_COLS["signed_market"], "market"),
+    ]
+    first = row + 1
+    for offset, (name, err_col, signed_col, key) in enumerate(methods):
+        r = first + offset
+        err_range = _rng(err_col, last_row)
+        signed_range = _rng(signed_col, last_row)
+        errors = pd.Series(derived[f"err_total_{key}"]).dropna()
+        signed = pd.Series(derived[f"signed_total_{key}"]).dropna()
+
+        _value(sheet, r, 1, name)
+        rec.formula(sheet, r, 2, f"=COUNT({err_range})", int(len(errors)), "#,##0")
+        rec.formula(sheet, r, 3, f"=AVERAGE({err_range})", _mean(errors), "0.000")
+        # SUMSQ skips text and blanks, so the range needs no masking.
+        rec.formula(
+            sheet, r, 4,
+            f"=SQRT(SUMSQ({err_range})/COUNT({err_range}))",
+            float(np.sqrt((errors**2).mean())) if len(errors) else float("nan"),
+            "0.000",
+        )
+        rec.formula(sheet, r, 5, f"=AVERAGE({signed_range})", _mean(signed), "+0.000;-0.000")
+
+    row = first + len(methods) + 2
+    sheet.cell(row=row, column=1, value="Over/under record").font = _SECTION_FONT
+    row += 1
+    _write_header(sheet, row, ["Min edge", "Bets", "Won", "Lost", "Push", "Win %", "ROI"])
+
+    edge_range = _rng(TOTAL_COLS["edge"], last_row)
+    result_range = _rng(TOTAL_COLS["result"], last_row)
+    payout = 100.0 / abs(config.STANDARD_VIG_ODDS)
+
+    graded = derived[derived["ou_result"].isin(["W", "L", "P"])]
+    first_bet = row + 1
+    for offset, threshold in enumerate((0.0, 1.0, 2.0, 3.0, 4.0, 5.0)):
+        r = first_bet + offset
+        bucket = graded[graded["ou_edge"].abs() >= threshold]
+        wins = int((bucket["ou_result"] == "W").sum())
+        losses = int((bucket["ou_result"] == "L").sum())
+        pushes = int((bucket["ou_result"] == "P").sum())
+        decided = wins + losses
+
+        _value(sheet, r, 1, threshold, "0.0")
+        rec.formula(
+            sheet, r, 2,
+            f'=COUNTIFS({edge_range},">="&$A{r})+COUNTIFS({edge_range},"<="&-$A{r})'
+            if threshold else f"=COUNT({edge_range})",
+            len(bucket), "#,##0",
+        )
+        for col, code, value in ((3, "W", wins), (4, "L", losses), (5, "P", pushes)):
+            rec.formula(
+                sheet, r, col,
+                f'=COUNTIFS({result_range},"{code}",{edge_range},">="&$A{r})'
+                f'+COUNTIFS({result_range},"{code}",{edge_range},"<="&-$A{r})',
+                value, "#,##0",
+            )
+        rec.formula(
+            sheet, r, 6, f'=IF($C{r}+$D{r}=0,"",$C{r}/($C{r}+$D{r}))',
+            float(wins / decided) if decided else None, PCT2,
+        )
+        rec.formula(
+            sheet, r, 7,
+            f'=IF($C{r}+$D{r}=0,"",($C{r}*{payout:.6f}-$D{r})/($C{r}+$D{r}))',
+            float((wins * payout - losses) / decided) if decided else None, PCT2,
+        )
+
+    last = first_bet + 6
+    _note(sheet, last + 1,
+          f"Breakeven at {config.STANDARD_VIG_ODDS} is "
+          f"{1 / (1 + payout) * 100:.2f}%. Edge is graded against the model's own "
+          "total, not the blend.")
+    _note(sheet, last + 2,
+          "The 3-4 point buckets edge just past breakeven, but on 940-1,612 bets "
+          "the standard error is around 1.5 points of win rate -- that is noise, "
+          "not a system.")
+    _set_widths(sheet, [26, 10, 10, 10, 10, 11, 11])
 
 
 def _build_ratings(sheet, rec: Recorder, ratings: pd.DataFrame) -> None:
@@ -622,11 +892,13 @@ _READ_ME = [
     ("title", "nflpredict -- Model Output Workbook"),
     ("blank", ""),
     ("head", "What is in here"),
-    ("text", "Predictions -- the upcoming slate: pick, win probability, confidence tier, and the model's spread against the posted line."),
+    ("text", "Predictions -- the upcoming slate: pick, win probability, confidence tier, the model's spread against the posted line, and its fair moneyline against the posted price."),
+    ("text", "Point Totals -- the same slate scored for points: the model's own total, the posted total, the blend of the two, and the over/under it implies."),
     ("text", "Power Ratings -- every franchise's current Elo, and what it is worth in points."),
     ("text", "Backtest Summary -- the model measured against the market, against Elo alone, and against simply picking the home team."),
     ("text", "Calibration -- whether a stated 70% actually wins 70% of the time."),
     ("text", "Against the Spread -- the betting record at several edge thresholds."),
+    ("text", "Point Totals Backtest -- how far the totals forecast missed by, and its over/under record at several edge thresholds."),
     ("text", "Accuracy by Season -- year-by-year out-of-sample results."),
     ("text", "Game Log -- every backtested game, one row each. Every summary figure is a live formula over this sheet."),
     ("blank", ""),
@@ -634,6 +906,7 @@ _READ_ME = [
     ("text", "About two games in three. Walk-forward across the backtest range it hits roughly 66.6% straight up, which is level with the Vegas closing line and no better than it."),
     ("text", "Roughly a third of NFL games turn on events with no predictable structure: a tipped pass, a missed field goal, a fumble bounce. No model removes that, and this one does not try to pretend otherwise."),
     ("text", "Against the spread it wins about 49.6% and loses money at standard -110 pricing, where 52.38% is breakeven. Any tool claiming 90%+ accuracy or guaranteed picks is fitting noise or testing on data it already trained on."),
+    ("text", "Point totals are harder still. The model misses the final total by about 10.7 points on average; the closing total misses by 10.5. Its over/under picks hit 50.8%, also short of breakeven. Totals are a forecast of how a game will be played, not a soft spot in the market."),
     ("blank", ""),
     ("head", "Why these numbers can be trusted"),
     ("text", "Every figure came from walk-forward testing: for each week, the model was fitted only on games that had already finished. It never saw a result from its own slate or from any later week."),
@@ -669,7 +942,10 @@ def _build_read_me(sheet, meta: dict) -> None:
         ("Backtest range", f"{meta['start']}-{meta['end']}"),
         ("Games backtested", f"{meta['n_games']:,}"),
         ("Slate", f"{meta['slate_season']} week {meta['slate_week']}"),
-        ("Market blend weight", f"{meta['market_blend']:.2f}"),
+        ("Market blend weight (sides)", f"{meta['market_blend']:.2f}"),
+        ("Market blend weight (totals)", f"{meta.get('total_blend', 0.10):.2f}"),
+        ("Totals sigma (points)", f"{meta.get('total_sigma', float('nan')):.2f}"),
+        ("Current-season games in fit", meta.get("slate_history_note") or "none yet"),
         ("Data source", "nflverse (nfldata game log + nflverse-data play-by-play)"),
     ):
         _value(sheet, row, 1, label, font=_BOLD)
@@ -700,8 +976,9 @@ def export_workbook(path, *, slate: pd.DataFrame, ratings: pd.DataFrame, result,
     sheets = {
         name: workbook.create_sheet(name)
         for name in (
-            "Read Me", "Predictions", "Power Ratings", "Backtest Summary",
-            "Calibration", "Against the Spread", "Accuracy by Season", "Game Log",
+            "Read Me", "Predictions", "Point Totals", "Power Ratings",
+            "Backtest Summary", "Calibration", "Against the Spread",
+            "Point Totals Backtest", "Accuracy by Season", "Game Log",
         )
     }
 
@@ -718,10 +995,12 @@ def export_workbook(path, *, slate: pd.DataFrame, ratings: pd.DataFrame, result,
 
     _build_read_me(sheets["Read Me"], meta)
     _build_predictions(sheets["Predictions"], rec, slate, meta)
+    _build_totals_slate(sheets["Point Totals"], rec, slate, meta)
     _build_ratings(sheets["Power Ratings"], rec, ratings)
     _build_summary(sheets["Backtest Summary"], rec, last_row, derived, meta)
     _build_calibration(sheets["Calibration"], rec, last_row, derived)
     _build_ats(sheets["Against the Spread"], rec, last_row, derived)
+    _build_totals_backtest(sheets["Point Totals Backtest"], rec, last_row, derived)
     _build_by_season(sheets["Accuracy by Season"], rec, last_row, derived)
 
     workbook.save(path)

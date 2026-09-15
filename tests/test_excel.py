@@ -19,8 +19,11 @@ from openpyxl import load_workbook
 
 from nflpredict import backtest as bt
 from nflpredict.backtest import walk_forward
+from nflpredict.edge import attach_edges
 from nflpredict.excel import _derive, export_workbook
 from nflpredict.features import build_features
+from nflpredict.model import GamePredictor
+from nflpredict.totals import TotalsPredictor
 
 
 @pytest.fixture(scope="module")
@@ -29,10 +32,19 @@ def workbook(tmp_path_factory, games, team_epa):
     result = walk_forward(
         features, start_season=2021, end_season=2022, refit="season", quiet=True
     )
+    history = features[features["completed"] & (features["season"] < 2022)]
     slate = features[(features["season"] == 2022) & (features["week"] == 1)].copy()
-    slate["prob_home"] = 0.6
-    slate["pred_margin"] = 3.0
-    slate["market_prob_home"] = 0.55
+
+    winner = GamePredictor().fit(history).predict(slate)
+    totals = TotalsPredictor().fit(history).predict(slate)
+    for predictions in (winner, totals):
+        payload = predictions.drop(columns=["game_id"]).assign(
+            game_id=predictions["game_id"].values
+        )
+        clashes = [c for c in payload.columns if c != "game_id" and c in slate.columns]
+        slate = slate.drop(columns=clashes).merge(payload, on="game_id", how="left")
+    slate["actual_total"] = TotalsPredictor.actual_total(slate)
+    slate = attach_edges(slate)
 
     engine_ratings = pd.DataFrame(
         {"team": ["KC", "BUF"], "elo": [1650.0, 1600.0], "spread_vs_average": [6.0, 4.0]}
@@ -51,6 +63,8 @@ def workbook(tmp_path_factory, games, team_epa):
             "slate_week": 1,
             "slate_train": 1000,
             "market_blend": 0.10,
+            "total_blend": 0.10,
+            "total_sigma": 13.3,
         },
     )
     return path, result
@@ -59,8 +73,9 @@ def workbook(tmp_path_factory, games, team_epa):
 def test_workbook_has_every_expected_sheet(workbook):
     path, _ = workbook
     assert load_workbook(path).sheetnames == [
-        "Read Me", "Predictions", "Power Ratings", "Backtest Summary",
-        "Calibration", "Against the Spread", "Accuracy by Season", "Game Log",
+        "Read Me", "Predictions", "Point Totals", "Power Ratings",
+        "Backtest Summary", "Calibration", "Against the Spread",
+        "Point Totals Backtest", "Accuracy by Season", "Game Log",
     ]
 
 

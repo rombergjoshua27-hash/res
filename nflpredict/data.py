@@ -180,12 +180,12 @@ def _win_value(margin: float) -> float:
 _PBP_COLUMNS = [
     "game_id", "season", "week", "posteam", "defteam", "epa", "success",
     "pass", "rush", "play_type", "qb_epa", "yards_gained", "interception",
-    "fumble_lost", "sack",
+    "fumble_lost", "sack", "drive",
 ]
 
 
 def _season_epa_path(season: int) -> Path:
-    return config.EPA_CACHE_DIR / f"team_game_epa_{season}.csv"
+    return config.EPA_CACHE_DIR / f"team_game_epa_v{config.EPA_CACHE_VERSION}_{season}.csv"
 
 
 def _aggregate_season_pbp(season: int, *, refresh: bool = False) -> pd.DataFrame:
@@ -259,15 +259,22 @@ def _aggregate_season_pbp(season: int, *, refresh: bool = False) -> pd.DataFrame
 _OFFENSE_STATS = [
     "off_epa_play", "off_pass_epa", "off_rush_epa", "off_success",
     "off_explosive", "off_turnover_rate", "off_sack_rate", "off_pass_rate",
+    "off_plays", "off_drives", "off_plays_per_drive",
 ]
 
 
 def _summarise_offense(frame: pd.DataFrame) -> pd.Series:
     is_pass = frame["pass"] > 0
     is_rush = frame["rush"] > 0
+    plays = float(len(frame))
+    # Drive count drives the totals model: points scored is roughly
+    # (drives) x (points per drive), so possessions are half the equation.
+    drives = float(frame["drive"].nunique()) if "drive" in frame.columns else float("nan")
     return pd.Series(
         {
-            "off_plays": float(len(frame)),
+            "off_plays": plays,
+            "off_drives": drives,
+            "off_plays_per_drive": plays / drives if drives and drives > 0 else float("nan"),
             "off_epa_play": frame["epa"].mean(),
             "off_pass_epa": frame.loc[is_pass, "epa"].mean(),
             "off_rush_epa": frame.loc[is_rush, "epa"].mean(),

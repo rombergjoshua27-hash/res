@@ -13,7 +13,7 @@ prior games (see ``features``). Only the supervised models are refit.
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List
 
 import numpy as np
@@ -21,12 +21,15 @@ import pandas as pd
 
 from . import config
 from .model import GamePredictor
+from .totals import TotalsPredictor
 
 __all__ = [
     "walk_forward",
     "evaluate",
+    "evaluate_totals",
     "calibration_table",
     "ats_record",
+    "ou_record",
     "BacktestResult",
 ]
 
@@ -157,6 +160,81 @@ def ats_record(
     }
 
 
+def evaluate_totals(frame: pd.DataFrame, total_col: str = "pred_total") -> Dict[str, float]:
+    """Mean absolute error, RMSE and bias for a frame of total forecasts.
+
+    Totals are scored as a regression rather than a classification: the
+    useful question is how many points the forecast missed by, not whether
+    it landed on the right side of a line.
+    """
+    scored = frame[frame["actual_total"].notna() & frame[total_col].notna()]
+    if scored.empty:
+        return {"n": 0}
+
+    error = scored["actual_total"].to_numpy(dtype=float) - scored[total_col].to_numpy(
+        dtype=float
+    )
+    return {
+        "n": int(len(scored)),
+        "mae": float(np.mean(np.abs(error))),
+        "rmse": float(np.sqrt(np.mean(error**2))),
+        "bias": float(np.mean(error)),
+        "mean_total": float(np.mean(scored[total_col])),
+    }
+
+
+def ou_record(
+    frame: pd.DataFrame,
+    *,
+    total_col: str = "model_total",
+    threshold: float = 0.0,
+    odds: int = config.STANDARD_VIG_ODDS,
+) -> Dict[str, float]:
+    """Over/under record for picks whose disagreement with the line clears
+    ``threshold`` points.
+
+    The edge is measured against the model's *own* number rather than the
+    blended one, because the blend is mostly the line itself -- measuring
+    against it would report the line's disagreement with itself.
+    """
+    playable = frame[
+        frame["actual_total"].notna()
+        & frame["market_total"].notna()
+        & frame[total_col].notna()
+    ].copy()
+    if playable.empty:
+        return {"bets": 0, "threshold": threshold}
+
+    playable["edge"] = playable[total_col] - playable["market_total"]
+    playable = playable[playable["edge"].abs() >= threshold]
+    if playable.empty:
+        return {"bets": 0, "threshold": threshold}
+
+    took_over = playable["edge"] > 0
+    diff = playable["actual_total"] - playable["market_total"]
+    result = np.where(took_over, diff, -diff)
+
+    wins = int(np.sum(result > 0))
+    losses = int(np.sum(result < 0))
+    pushes = int(np.sum(result == 0))
+    decided = wins + losses
+
+    payout = 100.0 / abs(odds) if odds < 0 else odds / 100.0
+    profit = wins * payout - losses
+
+    return {
+        "bets": int(len(playable)),
+        "threshold": float(threshold),
+        "wins": wins,
+        "losses": losses,
+        "pushes": pushes,
+        "win_rate": float(wins / decided) if decided else float("nan"),
+        "roi": float(profit / decided) if decided else float("nan"),
+        "units": float(profit),
+        "breakeven": float(1.0 / (1.0 + payout)),
+    }
+
+
 # --------------------------------------------------------------------------
 # Walk-forward driver
 # --------------------------------------------------------------------------
@@ -169,6 +247,8 @@ class BacktestResult:
     calibration: pd.DataFrame
     by_season: pd.DataFrame
     ats: List[Dict[str, float]]
+    totals: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    ou: List[Dict[str, float]] = field(default_factory=list)
 
     def __repr__(self) -> str:  # pragma: no cover - display helper
         model = self.summary.get("model", {})
@@ -185,6 +265,7 @@ def walk_forward(
     end_season: int | None = None,
     use_market: bool = True,
     market_blend: float = config.DEFAULT_MARKET_BLEND,
+    total_blend: float = config.DEFAULT_TOTAL_MARKET_BLEND,
     refit: str = "week",
     min_train_games: int = 600,
     quiet: bool = False,
@@ -213,6 +294,7 @@ def walk_forward(
     slates = sorted(target["period"].unique())
     predictions: List[pd.DataFrame] = []
     predictor: GamePredictor | None = None
+    totals_predictor: TotalsPredictor | None = None
     fitted_for_season: int | None = None
     fits = 0
 
@@ -227,11 +309,15 @@ def walk_forward(
             predictor = GamePredictor(
                 use_market=use_market, market_blend=market_blend
             ).fit(history)
+            totals_predictor = TotalsPredictor(
+                use_market=use_market, market_blend=total_blend
+            ).fit(history)
             fitted_for_season = season
             fits += 1
 
         slate = frame[(frame["period"] == period) & frame["completed"]]
         preds = predictor.predict(slate)
+        total_preds = totals_predictor.predict(slate)
 
         carry = [
             "game_id", "season", "week", "home_team", "away_team", "margin",
@@ -242,7 +328,14 @@ def walk_forward(
             preds.drop(columns=["game_id"]).assign(game_id=preds["game_id"].values),
             on="game_id",
             how="left",
+        ).merge(
+            total_preds.drop(columns=["game_id"]).assign(
+                game_id=total_preds["game_id"].values
+            ),
+            on="game_id",
+            how="left",
         )
+        merged["actual_total"] = TotalsPredictor.actual_total(slate).to_numpy()
         merged["n_train"] = predictor.report.n_train
         predictions.append(merged)
 
@@ -306,10 +399,19 @@ def walk_forward(
         ats_record(scored, threshold=t) for t in (0.0, 0.5, 1.0, 1.5, 2.0, 3.0)
     ]
 
+    totals = {
+        "blended": evaluate_totals(scored, "pred_total"),
+        "model": evaluate_totals(scored, "model_total"),
+        "market": evaluate_totals(scored, "market_total"),
+    }
+    ou = [ou_record(scored, threshold=t) for t in (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)]
+
     return BacktestResult(
         predictions=scored,
         summary=summary,
         calibration=calibration_table(scored, "prob_home"),
         by_season=by_season,
         ats=ats,
+        totals=totals,
+        ou=ou,
     )

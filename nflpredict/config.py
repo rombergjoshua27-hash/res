@@ -37,6 +37,10 @@ GAMES_CACHE_HOURS = 6.0
 # Play-by-play availability. EPA is only modelled from 1999 onward.
 FIRST_PBP_SEASON = 1999
 
+# Bumped whenever the team-game aggregate schema changes, so a stale cache is
+# rebuilt rather than read back with columns silently missing.
+EPA_CACHE_VERSION = 2
+
 DOWNLOAD_RETRIES = 4
 DOWNLOAD_BACKOFF_SECONDS = 2.0
 DOWNLOAD_TIMEOUT_SECONDS = 300
@@ -101,6 +105,10 @@ REST_DIFF_CAP_DAYS = 10.0
 #     QB scale=25 cap=4     64.10%  brier 0.2192
 #     QB scale=45 cap=6     64.04%  brier 0.2207
 #
+# Re-confirmed on 2008-2026 with the current feature set: the default
+# scale takes the model from 65.1% / brier 0.2186 / log loss 0.6281 to
+# 64.1% / 0.2206 / 0.6325, and drags Elo alone from 65.1% to 63.3%.
+#
 # The cause is double counting: this rating attributes whole-team offensive
 # EPA to the starter, but team strength is already in the Elo rating, so the
 # adjustment re-applies a signal the model has. Isolating true QB value needs
@@ -123,6 +131,39 @@ MARGIN_SIGMA = 13.2
 
 # Ties are rare (15 / 7548 = 0.2%) and are scored as half a win.
 TIE_CREDIT = 0.5
+
+# --------------------------------------------------------------------------
+# Point totals
+# --------------------------------------------------------------------------
+
+# EMPIRICAL: std(actual total - closing total) = 13.43 over 1999-2026,
+# 13.31 over 2007-2026, 13.24 over 2015-2026. Used to turn a predicted total
+# into an over/under probability. A fitted model re-measures this on its own
+# residuals; this is the fallback and the sanity bound.
+TOTAL_SIGMA = 13.3
+
+# Weight on the model when blending with the posted total.
+#
+# Tuned on 2008-2017 (n=2,670) and validated on 2018-2026 (n=2,242). The
+# result is the same one the spread gives: the closing number is already
+# about as good as this gets. Held-out MAE by weight:
+#
+#     w=0.00 (market only)  10.4300
+#     w=0.10                10.4270   <- held-out optimum
+#     w=0.20                10.4304   <- optimum on the tuning years
+#     w=0.50                10.4756
+#
+# The tuning years picked w=0.20, which on held-out data was 0.0004 points
+# per game *worse* than simply posting the market number. 0.10 is kept
+# because it is the held-out optimum and matches the spread default, but the
+# honest reading is that the curve is flat and none of this is a real edge.
+# `--total-blend` overrides it; `--no-market` gives the pure model, which is
+# what a game with no posted total gets anyway.
+DEFAULT_TOTAL_MARKET_BLEND = 0.10
+
+# Roughly half of posted totals are whole numbers, and 2.9% of those land
+# exactly on the number for a push. Reported, never silently dropped.
+TOTAL_PUSH_RATE_WHOLE_LINES = 0.0286
 
 # --------------------------------------------------------------------------
 # Rolling team form (EPA) features
