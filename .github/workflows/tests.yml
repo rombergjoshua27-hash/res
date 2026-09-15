@@ -1,7 +1,12 @@
 name: Tests
 
 on:
+  # Pushes are limited to the default branch on purpose. An unrestricted
+  # `push:` fires alongside `pull_request:` for the same commit, so every
+  # push to a PR branch ran the whole matrix twice -- four check runs for two
+  # jobs. This way the base branch stays covered and a PR is tested once.
   push:
+    branches: [claude/nfl-game-predictor-m4va67]
   pull_request:
 
 # A second push while the first is still running only ever wastes a runner.
