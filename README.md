@@ -223,26 +223,43 @@ returns the live scorecard.
 
 ## The Excel workbook
 
-`nflpredict predict` writes a **seven-sheet slate workbook in about five
-seconds**. `nflpredict export` writes the full thirteen-sheet version with
-all the backtest evidence behind it, which takes a few minutes because it
-replays nineteen seasons to get there.
+One workbook, sixteen tabs, built in about 30 seconds. It opens on **Start
+Here** — the week at a glance, then a linked index of every tab.
 
-| Sheet | Slate | Full | What it holds |
-|---|:-:|:-:|---|
-| Read Me | ● | ● | What everything means, and how accurate it honestly is |
-| Predictions | ● | ● | Pick, win %, confidence, model spread vs. the line, **fair moneyline vs. the book's price, and EV per $1** |
-| Point Totals | ● | ● | Model total, posted total, the blend, over/under and P(over) |
-| Team Totals | ● | ● | Each side's points and the first-half split, as live formulas |
-| Player Projections | ● | ● | Projected passing, rushing and receiving yards |
-| Season Scorecard | ● | ● | How this season's picks have actually landed, week by week |
-| Power Ratings | ● | ● | Every franchise's Elo, in points |
-| Backtest Summary | | ● | Model vs. market vs. Elo vs. picking the home team |
-| Calibration | | ● | Whether a stated 70% wins 70% |
-| Against the Spread | | ● | ATS record at six edge thresholds |
-| Point Totals Backtest | | ● | MAE, RMSE and bias, plus the over/under record |
-| Accuracy by Season | | ● | Year-by-year out-of-sample results |
-| Game Log | | ● | Every backtested game, one row each |
+| Tab | What it holds |
+|---|---|
+| **Start Here** | The week at a glance, and a link to everything else |
+| Predictions | Pick, win %, confidence, model spread vs. the line, **fair moneyline vs. the book's price, EV per $1**, and a column for your own picks |
+| **Matchup Picker** | Two dropdowns — pick any teams, everything recalculates live |
+| Point Totals | Model total, posted total, the blend, over/under and P(over) |
+| Team Totals | Each side's points and the first-half split, as live formulas |
+| Player Projections | Projected passing, rushing and receiving yards |
+| Season Scorecard | How this season's picks have actually landed, week by week |
+| Power Ratings | Every franchise's Elo, in points |
+| Team Data | The per-team figures the Matchup Picker reads |
+| Backtest Summary | Model vs. market vs. Elo vs. picking the home team |
+| Calibration | Whether a stated 70% wins 70% |
+| Against the Spread | ATS record at six edge thresholds |
+| Point Totals Backtest | MAE, RMSE and bias, plus the over/under record |
+| Accuracy by Season | Year-by-year out-of-sample results |
+| Game Log | Every backtested game, one row each |
+| Read Me | What everything means, and how accurate it honestly is |
+
+**Yellow cells are yours to edit**; everything else is a formula you can
+click to check.
+
+### The Matchup Picker
+
+Choose any two teams from the dropdowns and the whole panel recalculates —
+spread, both moneylines, total, both team totals — as Excel formulas over the
+Team Data tab. No regeneration, no Python.
+
+Where the chosen pair is actually on this week's slate, the sheet also shows
+what the full model says, **because the two will not agree**. This week it
+has MIA @ SF at 9.5 by the picker and 14.7 by the model: the picker is Elo
+plus raw scoring averages, which is all that fits in a spreadsheet formula,
+and it cannot see that Miami is starting a backup. The picker is a quick
+what-if for matchups nobody has priced; the Predictions tab is the forecast.
 
 Every summary figure is a **live formula over the Game Log**, not a value
 pasted in by Python — so filtering the log re-scores the whole workbook, and
@@ -476,6 +493,33 @@ line already prices a backup quarterback and a Friday injury report. It is
 on by default because the market-free path is the one that matters when no
 line is posted; `--no-qb-features` turns it off.
 
+## Keeping it current
+
+```bash
+nflpredict refresh          # pull the latest data, rebuild the workbook
+```
+
+Only the current season is re-downloaded. Scores, closing lines, listed
+quarterbacks and the injury report all move during a week; seasons that have
+finished do not, and re-fetching twenty of them daily would be twenty minutes
+of downloading to discover nothing had happened.
+
+**It also runs itself.** `.github/workflows/refresh.yml` rebuilds the
+workbook every morning at 11:00 UTC and publishes it two ways: as an artifact
+on the run, and as an asset on a `latest` release, so there is always a
+stable URL pointing at the newest build. It can also be triggered by hand
+from the Actions tab, optionally for a specific week.
+
+The schedule rolls the slate forward on its own — once a week is mostly
+played, the model starts predicting the next one — so nothing needs asking
+for again.
+
+The walk-forward backtest is cached and keyed on everything that could change
+its answer: completed games, seasons, blend weights, and whether the passer
+terms were fitted. Only the per-game rows are stored; every summary is
+recomputed on load, so a change to how a metric is defined can never be
+masked by a stale number.
+
 ## Tracking the season
 
 ```bash
@@ -518,7 +562,7 @@ Cached under `data/` (gitignored). `nflpredict update` refreshes.
 
 ```bash
 pip install -e . && pip install pytest
-pytest -q        # 160 tests
+pytest -q        # 177 tests
 ```
 
 Layout: `data.py` fetch/cache · `players.py` player box scores and injuries ·
@@ -527,7 +571,7 @@ ensemble + blend · `totals.py` point totals · `qb.py` passer value and
 availability · `splits.py` team totals and half lines · `props.py` player
 projections · `backtest.py` walk-forward, metrics and season tracking ·
 `edge.py` EV, fair odds and Kelly · `report.py` formatting · `excel.py`
-workbooks · `cli.py` commands.
+workbook · `cache.py` backtest cache · `cli.py` commands.
 
 ## Using this responsibly
 

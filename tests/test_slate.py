@@ -70,6 +70,16 @@ def test_an_explicit_week_overrides_the_default(schedule):
     assert _target_slate(schedule, _args(season=2026, week=1)) == (2026, 1)
 
 
+def test_a_week_on_its_own_is_enough(schedule):
+    """Only one season is ever in progress, so --week needs no --season."""
+    assert _target_slate(schedule, _args(week=1)) == (2026, 1)
+
+
+def test_an_unknown_season_is_refused_rather_than_ignored(schedule):
+    with pytest.raises(SystemExit, match="no games on record"):
+        _target_slate(schedule, _args(season=1998))
+
+
 def test_a_finished_season_falls_back_to_its_last_week(schedule):
     frame = schedule.copy()
     frame["completed"] = True
@@ -140,3 +150,64 @@ def test_the_default_backtest_range_clears_the_warmup_season():
 
 def test_the_guard_does_not_apply_without_play_by_play():
     _guard_warmup_season(_args(start=2006, epa_start=2006, no_epa=True))
+
+
+# --------------------------------------------------------------------------
+# The command line the scheduled job depends on
+# --------------------------------------------------------------------------
+
+
+def test_the_scheduled_refresh_flags_all_parse():
+    """The workflow calls these by name; a rename here breaks it silently."""
+    from nflpredict.cli import build_parser
+
+    parsed = build_parser().parse_args(
+        ["refresh", "--prune-raw", "--quiet", "--season", "2026", "--week", "3"]
+    )
+    assert parsed.command == "refresh"
+    assert parsed.prune_raw is True
+    assert parsed.quiet is True
+    assert (parsed.season, parsed.week) == (2026, 3)
+
+
+def test_refresh_accepts_an_output_path():
+    from nflpredict.cli import build_parser
+
+    parsed = build_parser().parse_args(["refresh", "-o", "/tmp/book.xlsx"])
+    assert parsed.excel == "/tmp/book.xlsx"
+
+
+def test_every_subcommand_is_still_reachable():
+    from nflpredict.cli import build_parser
+
+    parser = build_parser()
+    for command in (
+        "predict", "refresh", "track", "backtest", "ratings",
+        "evaluate", "export", "update",
+    ):
+        assert parser.parse_args([command]).command == command
+
+
+def test_pruning_raw_downloads_reports_what_it_removed(tmp_path, monkeypatch):
+    """Raw play-by-play is re-downloadable; the summaries built from it are not."""
+    from nflpredict import cli, config
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    raw = tmp_path / "pbp"
+    raw.mkdir()
+    for season in (2024, 2025):
+        (raw / f"play_by_play_{season}.csv.gz").write_bytes(b"x")
+    keep = tmp_path / "epa"
+    keep.mkdir()
+    (keep / "team_game_epa_v2_2025.csv").write_text("kept")
+
+    assert cli._prune_raw_downloads() == 2
+    assert not list(raw.glob("*.csv.gz"))
+    assert (keep / "team_game_epa_v2_2025.csv").read_text() == "kept"
+
+
+def test_pruning_is_safe_when_there_is_nothing_to_prune(tmp_path, monkeypatch):
+    from nflpredict import cli, config
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    assert cli._prune_raw_downloads() == 0

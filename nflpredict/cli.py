@@ -2,6 +2,7 @@
 
     nflpredict predict                 # next unplayed slate
     nflpredict predict --week 5        # a specific week
+    nflpredict refresh                 # pull latest data, rebuild the workbook
     nflpredict track                   # grade this season's picks so far
     nflpredict backtest                # prove the accuracy claim
     nflpredict ratings                 # current Elo power ratings
@@ -81,8 +82,15 @@ def _target_slate(features: pd.DataFrame, args) -> Tuple[int, int]:
     the finished results feed the fit instead. ``--week`` still reaches the
     straggler.
     """
-    if args.season and args.week:
-        return int(args.season), int(args.week)
+    # A week on its own is a complete instruction -- there is only one season
+    # in progress. Requiring both flags silently ignored `--week 3`.
+    if args.week:
+        season = int(args.season) if args.season else int(features["season"].max())
+        return season, int(args.week)
+    if args.season and not args.week:
+        in_season = features[features["season"] == int(args.season)]
+        if in_season.empty:
+            raise SystemExit(f"no games on record for {args.season}")
 
     pending = features[~features["completed"]]
     if args.season:
@@ -585,6 +593,83 @@ def cmd_track(args) -> int:
     return 0
 
 
+def cmd_refresh(args) -> int:
+    """Pull the latest data and rebuild the workbook, in one command.
+
+    Only the current season is re-downloaded. Scores, closing lines, listed
+    quarterbacks and the injury report all move during a week; seasons that
+    have finished do not change, and re-fetching twenty of them daily would
+    be twenty minutes of downloading to discover nothing had happened.
+    """
+    from .data import _season_epa_path, _half_score_path
+
+    games = load_games(refresh=True, quiet=args.quiet)
+    season = int(games["season"].max())
+    if not args.quiet:
+        print(f"Refreshing {season} ...")
+
+    # Dropping the season's caches is what forces them to rebuild below.
+    for path in (_season_epa_path(season), _half_score_path(season)):
+        path.unlink(missing_ok=True)
+    for kind in ("stats_player", "injuries"):
+        stale = config.PLAYER_CACHE_DIR / (
+            f"{kind}_v{config.PLAYER_CACHE_VERSION}_{season}.csv"
+        )
+        stale.unlink(missing_ok=True)
+
+    completed_before = int(games["completed"].sum())
+    args.refresh = False  # the game log is already current
+    _, features = _build(args)
+
+    season, week = _target_slate(features, args)
+    slate_out, predictor, totals, history, splits, props, scorecard = _predict_slate(
+        features, season, week, args
+    )
+
+    result, hit = cached_walk_forward(
+        features,
+        start_season=getattr(args, "start", None) or config.DEFAULT_BACKTEST_START,
+        use_market=not args.no_market,
+        market_blend=args.market_blend,
+        total_blend=args.total_blend,
+        use_qb_features=_qb_features_enabled(args),
+        refit="season",
+        quiet=args.quiet,
+    )
+    if not args.quiet and not hit:
+        print("Results changed, so the backtest was rerun ...")
+
+    print(_write_workbook(
+        slate_out, season, week, args, predictor, totals, history,
+        props, scorecard, result,
+    ))
+    print(
+        f"  {completed_before:,} completed games on record | "
+        f"predicting {season} week {week}"
+    )
+    if args.prune_raw:
+        removed = _prune_raw_downloads()
+        if removed and not args.quiet:
+            print(f"  removed {removed} raw play-by-play file(s) to save space")
+    return 0
+
+
+def _prune_raw_downloads() -> int:
+    """Delete raw play-by-play, which is only ever an input to the caches.
+
+    Each file is ~18 MB and re-downloadable; the summaries distilled from
+    them are ~60 KB per season. Worth having behind a flag for anywhere the
+    cache is kept between runs, like a scheduled job.
+    """
+    raw = config.DATA_DIR / "pbp"
+    if not raw.exists():
+        return 0
+    files = list(raw.glob("*.csv.gz"))
+    for path in files:
+        path.unlink(missing_ok=True)
+    return len(files)
+
+
 def cmd_update(args) -> int:
     games = load_games(refresh=True, quiet=False)
     seasons = range(args.epa_start, int(games["season"].max()) + 1)
@@ -719,6 +804,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     track.add_argument("--season", type=int, default=None)
     track.set_defaults(func=cmd_track)
+
+    refresh = subparsers.add_parser(
+        "refresh", parents=[common],
+        help="pull the latest data and rebuild the workbook",
+    )
+    refresh.add_argument("--season", type=int, help="slate season (default: current)")
+    refresh.add_argument("--week", type=int, help="slate week (default: next unplayed)")
+    refresh.add_argument("--start", type=int, default=config.DEFAULT_BACKTEST_START)
+    refresh.add_argument("-o", "--output", dest="excel", help="workbook path")
+    refresh.add_argument(
+        "--prune-raw", action="store_true",
+        help="delete raw play-by-play afterwards (it is re-downloadable)",
+    )
+    refresh.set_defaults(func=cmd_refresh)
 
     update = subparsers.add_parser(
         "update", parents=[common], help="refresh cached data"
