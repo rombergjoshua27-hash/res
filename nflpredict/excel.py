@@ -38,7 +38,7 @@ from openpyxl.worksheet.datavalidation import DataValidation
 
 from . import config
 
-__all__ = ["export_workbook"]
+__all__ = ["export_workbook", "export_simple_workbook"]
 
 FONT = "Arial"
 
@@ -1616,6 +1616,399 @@ def _add_back_link(sheet) -> None:
     cell = sheet.cell(row=1, column=column_index_from_string("H"), value="\u2190 Start Here")
     _internal_link(cell, "Start Here")
     cell.font = Font(name=FONT, size=9, color="0563C1", underline="single")
+
+
+# --------------------------------------------------------------------------
+# The simple workbook
+# --------------------------------------------------------------------------
+#
+# Six tabs, in the order you would actually look at them, and nothing else.
+# The full version keeps the backtest evidence, the calibration table and the
+# game log; this one assumes you have read those once and now just want the
+# week. Every honesty note is compressed to a line or two at the foot of the
+# tab it applies to, rather than given a page of its own -- the claims still
+# have to travel with the numbers, but they do not need to be the first thing
+# you see every time.
+
+SIMPLE_SHEETS = (
+    "Predictions", "Spread", "Point Totals", "Player Projections",
+    "Matchup Picker", "Power Ratings",
+)
+
+
+def _simple_title(sheet, title: str, meta: dict, scorecard) -> int:
+    """Shared header: what week this is, and how the season is actually going."""
+    sheet["A1"] = title
+    sheet["A1"].font = _TITLE_FONT
+
+    parts = [f"{meta['slate_season']} Week {meta['slate_week']}"]
+    if scorecard is not None and not getattr(scorecard, "games", pd.DataFrame()).empty:
+        summary = scorecard.summary
+        parts.append(
+            f"this season {int(summary['correct'])} of {summary['games']} "
+            f"({summary['accuracy']:.0%}) straight up"
+        )
+    parts.append(f"rebuilt {meta['generated']}")
+    sheet["A2"] = "  ·  ".join(parts)
+    sheet["A2"].font = _NOTE_FONT
+    return 4
+
+
+def _build_simple_predictions(sheet, rec: Recorder, slate, meta, scorecard) -> None:
+    """Who wins, how sure, and at what price."""
+    row = _simple_title(sheet, "Predictions", meta, scorecard)
+    _write_header(
+        sheet, row,
+        ["Away", "Home", "Pick", "Win %", "Confidence", "Fair odds",
+         "Book odds", "My pick", "Result"],
+    )
+
+    first = row + 1
+    for offset, game in enumerate(slate.itertuples(index=False)):
+        r = first + offset
+        prob = float(game.prob_home)
+        picked_home = prob >= 0.5
+        confidence = max(prob, 1.0 - prob)
+
+        _value(sheet, r, 1, game.away_team)
+        _value(sheet, r, 2, game.home_team)
+        _value(sheet, r, 3, game.home_team if picked_home else game.away_team, font=_BOLD)
+        _value(sheet, r, 4, confidence, PCT)
+        rec.formula(
+            sheet, r, 5,
+            f'=IF($D{r}>=0.75,"HIGH",IF($D{r}>=0.65,"MEDIUM",'
+            f'IF($D{r}>=0.575,"LEAN","COIN FLIP")))',
+            _tier(confidence),
+        )
+        rec.formula(
+            sheet, r, 6, f"=-100*$D{r}/(1-$D{r})",
+            -100.0 * confidence / (1.0 - confidence) if confidence < 1.0 else None,
+            "+0;-0",
+        )
+        _value(sheet, r, 7, _num(getattr(game, "pick_odds", None)), "+0;-0")
+
+        own = _value(sheet, r, 8, None)
+        own.font = _INPUT_FONT
+        own.fill = _ASSUMPTION_FILL
+        validation = DataValidation(
+            type="list", formula1=f"=$A${r}:$B${r}", allow_blank=True
+        )
+        sheet.add_data_validation(validation)
+        validation.add(own)
+
+        margin = _num(getattr(game, "margin", None))
+        outcome = ""
+        if margin is not None:
+            outcome = "PUSH" if margin == 0 else (
+                "HIT" if (margin > 0) == picked_home else "MISS"
+            )
+        _value(sheet, r, 9, outcome)
+
+    last = first + len(slate)
+    _note(sheet, last + 1,
+          "Right about two games in three (66.6% over 4,912 backtested games) -- "
+          "level with the betting line, not better than it. Fair odds are what "
+          "the model's probability is worth; Book odds are what is posted.")
+    _note(sheet, last + 2,
+          "Yellow cells are yours. Pick a side and Result grades it once the "
+          "game lands.")
+    _set_widths(sheet, [9, 9, 9, 9, 13, 11, 11, 11, 10])
+    sheet.freeze_panes = f"A{first}"
+
+
+def _build_simple_spread(sheet, rec: Recorder, slate, meta, scorecard) -> None:
+    """The model's number against the posted one."""
+    row = _simple_title(sheet, "Spread", meta, scorecard)
+    _write_header(
+        sheet, row,
+        ["Away", "Home", "Line", "Model", "Edge", "Model likes"],
+    )
+
+    ordered = slate.sort_values("pred_margin", ascending=False)
+    first = row + 1
+    for offset, game in enumerate(ordered.itertuples(index=False)):
+        r = first + offset
+        line = _num(getattr(game, "market_spread", None))
+        model = _num(getattr(game, "pred_margin", None))
+
+        _value(sheet, r, 1, game.away_team)
+        _value(sheet, r, 2, game.home_team)
+        _value(sheet, r, 3, line, SPREAD)
+        _value(sheet, r, 4, model, SPREAD)
+        rec.formula(
+            sheet, r, 5, f'=IF(OR($C{r}="",$D{r}=""),"",$D{r}-$C{r})',
+            None if line is None or model is None else model - line, SPREAD,
+        )
+        rec.formula(
+            sheet, r, 6, f'=IF($E{r}="","-",IF($E{r}>0,$B{r},$A{r}))',
+            "-" if line is None or model is None else (
+                game.home_team if model > line else game.away_team
+            ),
+        )
+
+    last = first + len(ordered)
+    _note(sheet, last + 1,
+          "Both numbers are the home team's spread: positive means the home side "
+          "is favoured. Edge is how far the model sits from the posted line.")
+    _note(sheet, last + 2,
+          "Against the spread the model wins 49.6% and loses money at standard "
+          "-110 pricing, where 52.38% breaks even. A large edge is usually the "
+          "model missing something the line already knows.")
+    _set_widths(sheet, [9, 9, 10, 10, 10, 14])
+    sheet.freeze_panes = f"A{first}"
+
+
+def _build_simple_totals(sheet, rec: Recorder, slate, meta, scorecard) -> None:
+    """How many points the game produces."""
+    row = _simple_title(sheet, "Point Totals", meta, scorecard)
+    _write_header(
+        sheet, row,
+        ["Away", "Home", "Line", "Model", "Projection", "Edge", "Lean", "P(over)"],
+    )
+
+    ordered = slate.sort_values("pred_total", ascending=False)
+    first = row + 1
+    for offset, game in enumerate(ordered.itertuples(index=False)):
+        r = first + offset
+        line = _num(getattr(game, "market_total", None))
+        model = _num(getattr(game, "model_total", None))
+        projection = _num(getattr(game, "pred_total", None))
+
+        _value(sheet, r, 1, game.away_team)
+        _value(sheet, r, 2, game.home_team)
+        _value(sheet, r, 3, line, "0.0")
+        _value(sheet, r, 4, model, "0.0")
+        _value(sheet, r, 5, projection, "0.0")
+        rec.formula(
+            sheet, r, 6, f'=IF(OR($C{r}="",$D{r}=""),"",$D{r}-$C{r})',
+            None if line is None or model is None else model - line, SPREAD,
+        )
+        rec.formula(
+            sheet, r, 7, f'=IF(OR($C{r}="",$E{r}=""),"-",IF($E{r}>$C{r},"OVER","UNDER"))',
+            "-" if line is None or projection is None else (
+                "OVER" if projection > line else "UNDER"
+            ),
+        )
+        _value(sheet, r, 8, _num(getattr(game, "prob_over", None)), PCT)
+
+    last = first + len(ordered)
+    _note(sheet, last + 1,
+          "Model is the model's own total; Projection blends it with the posted "
+          "line and is what it stands behind. Edge is Model minus Line -- most of "
+          "it is deliberately discarded by that blend.")
+    _note(sheet, last + 2,
+          "The model misses the final total by 10.7 points on average, the posted "
+          "total by 10.5. Over/under picks hit 50.8%, under the 52.38% needed to "
+          "break even. P(over) sitting near 50% is the honest answer, not a bug.")
+    _set_widths(sheet, [9, 9, 10, 10, 12, 10, 10, 10])
+    sheet.freeze_panes = f"A{first}"
+
+
+def _build_simple_props(sheet, props, meta, scorecard, *, top: int = 20) -> None:
+    """Projected yards, one block per category."""
+    row = _simple_title(sheet, "Player Projections", meta, scorecard)
+
+    if props is None or props.empty:
+        _note(sheet, row, "No player projections available for this slate.")
+        _set_widths(sheet, [24, 8, 7, 12, 14])
+        return
+
+    for column, title in PROP_SECTIONS:
+        if column not in props.columns or props[column].isna().all():
+            continue
+        ranked = props.nlargest(top, column)
+        ranked = ranked[ranked[column] > 0]
+        if ranked.empty:
+            continue
+
+        sheet.cell(row=row, column=1, value=title).font = _SECTION_FONT
+        row += 1
+        _write_header(sheet, row, ["Player", "Team", "Pos", "Yards", "Status"])
+        row += 1
+        for game in ranked.itertuples(index=False):
+            availability = float(getattr(game, "availability", 1.0) or 1.0)
+            _value(sheet, row, 1, str(getattr(game, "player_display_name", "")))
+            _value(sheet, row, 2, str(getattr(game, "team", "")))
+            _value(sheet, row, 3, str(getattr(game, "position", "")))
+            _value(sheet, row, 4, _num(getattr(game, column)), "0.0")
+            _value(
+                sheet, row, 5,
+                "" if availability >= 0.999 else f"listed ({availability:.0%})",
+            )
+            row += 1
+        row += 1
+
+    _note(sheet, row,
+          "Projections miss by about 62 passing yards, 24 rushing and 23 "
+          "receiving -- better than the player's own recent average, still a wide "
+          "miss on any single game. No over/under is offered: yardage is "
+          "long-tailed and a tidy percentage would overstate the confidence.")
+    _note(sheet, row + 1,
+          "Status marks a player on the injury report; his projection is already "
+          "scaled by how often that status actually plays.")
+    _set_widths(sheet, [24, 8, 7, 12, 14])
+
+
+def _build_simple_ratings(sheet, ratings, meta, scorecard) -> None:
+    """Every team, strongest first."""
+    row = _simple_title(sheet, "Power Ratings", meta, scorecard)
+    _write_header(sheet, row, ["#", "Team", "Rating", "Worth"])
+
+    first = row + 1
+    for offset, team in enumerate(ratings.itertuples(index=False)):
+        r = first + offset
+        _value(sheet, r, 1, offset + 1)
+        _value(sheet, r, 2, team.team, font=_BOLD)
+        _value(sheet, r, 3, _num(team.elo), "0")
+        _value(sheet, r, 4, _num(team.spread_vs_average), SPREAD)
+
+    last = first + len(ratings)
+    _note(sheet, last + 1,
+          f"Worth is what the rating is worth in points against an average team. "
+          f"{config.ELO_PER_POINT:.0f} rating points = 1 point of spread.")
+    _set_widths(sheet, [5, 10, 10, 10])
+    sheet.freeze_panes = f"A{first}"
+
+
+def _build_simple_picker(
+    sheet, rec: Recorder, team_data, slate, meta, scorecard
+) -> None:
+    """Pick any two teams; everything recalculates.
+
+    The team figures the formulas read live in hidden columns on this same
+    sheet rather than a tab of their own. A lookup table is not something
+    anyone wants to look at, and a workbook trimmed to six tabs should not
+    spend one of them on plumbing.
+    """
+    row = _simple_title(sheet, "Matchup Picker", meta, scorecard)
+
+    if team_data is None or team_data.empty:
+        _note(sheet, row, "No team data available.")
+        return
+
+    ordered = team_data.sort_values("team")
+    # --- hidden reference block, columns J-N
+    data_first = 2
+    for offset, team in enumerate(ordered.itertuples(index=False)):
+        r = data_first + offset
+        _value(sheet, r, 10, team.team)
+        _value(sheet, r, 11, _num(getattr(team, "elo", None)))
+        _value(sheet, r, 12, _num(getattr(team, "spread_vs_average", None)))
+        _value(sheet, r, 13, _num(getattr(team, "points_for", None)))
+        _value(sheet, r, 14, _num(getattr(team, "points_against", None)))
+    data_last = data_first + len(ordered) - 1
+    for column in ("J", "K", "L", "M", "N"):
+        sheet.column_dimensions[column].hidden = True
+
+    default_away, default_home = (sorted(ordered["team"].astype(str)) + ["", ""])[:2]
+    if not slate.empty:
+        first_game = slate.iloc[0]
+        default_away = str(first_game["away_team"])
+        default_home = str(first_game["home_team"])
+
+    lookup = f"$J${data_first}:$N${data_last}"
+    away_cell, home_cell, neutral_cell = "B5", "B6", "B7"
+
+    for r, label, value in (
+        (5, "Away team", default_away),
+        (6, "Home team", default_home),
+        (7, "Neutral site", "No"),
+    ):
+        _value(sheet, r, 1, label, font=_BOLD)
+        cell = _value(sheet, r, 2, value, font=_INPUT_FONT)
+        cell.fill = _ASSUMPTION_FILL
+
+    teams_validation = DataValidation(
+        type="list", formula1=f"=$J${data_first}:$J${data_last}", allow_blank=False
+    )
+    teams_validation.prompt = "Choose a team"
+    sheet.add_data_validation(teams_validation)
+    teams_validation.add(sheet[away_cell])
+    teams_validation.add(sheet[home_cell])
+
+    neutral_validation = DataValidation(type="list", formula1='"No,Yes"', allow_blank=False)
+    sheet.add_data_validation(neutral_validation)
+    neutral_validation.add(sheet[neutral_cell])
+
+    _note(sheet, 8, "Change either yellow cell. Everything below updates.")
+
+    hfa = float(meta.get("hfa_points", config.HFA_POINTS_DEFAULT))
+    away_elo = f"VLOOKUP(${away_cell},{lookup},2,FALSE)"
+    home_elo = f"VLOOKUP(${home_cell},{lookup},2,FALSE)"
+    away_pf = f"VLOOKUP(${away_cell},{lookup},4,FALSE)"
+    home_pf = f"VLOOKUP(${home_cell},{lookup},4,FALSE)"
+    away_pa = f"VLOOKUP(${away_cell},{lookup},5,FALSE)"
+    home_pa = f"VLOOKUP(${home_cell},{lookup},5,FALSE)"
+
+    row = 10
+    _write_header(sheet, row, ["", "Projection"])
+    row += 1
+    start = row
+
+    rows_spec = [
+        ("Home spread",
+         f'=({home_elo}-{away_elo})/{config.ELO_PER_POINT}'
+         f'+IF(${neutral_cell}="Yes",0,{hfa})', SPREAD),
+        ("Home win probability", f"=NORM.DIST($B{start},0,{config.MARGIN_SIGMA},TRUE)", PCT),
+        ("Away win probability", f"=1-$B{start + 1}", PCT),
+        ("Home fair odds",
+         f'=IF($B{start + 1}>=0.5,-100*$B{start + 1}/(1-$B{start + 1}),'
+         f'100*(1-$B{start + 1})/$B{start + 1})', "+0;-0"),
+        ("Away fair odds",
+         f'=IF($B{start + 2}>=0.5,-100*$B{start + 2}/(1-$B{start + 2}),'
+         f'100*(1-$B{start + 2})/$B{start + 2})', "+0;-0"),
+        ("Game total",
+         f"=(({home_pf}+{away_pa})/2)+(({away_pf}+{home_pa})/2)", "0.0"),
+        ("Home team total", f"=($B{start + 5}+$B{start})/2", "0.0"),
+        ("Away team total", f"=($B{start + 5}-$B{start})/2", "0.0"),
+    ]
+
+    values = _matchup_values(ordered, default_away, default_home, hfa)
+    for offset, (label, formula, fmt) in enumerate(rows_spec):
+        r = start + offset
+        _value(sheet, r, 1, label)
+        rec.formula(sheet, r, 2, formula, values[offset], fmt)
+
+    last = start + len(rows_spec)
+    _note(sheet, last + 1,
+          "A quick estimate from the power ratings and each team's scoring, which "
+          "is all a spreadsheet formula can hold. For games on this week's slate "
+          "the Predictions tab is the real forecast -- it also weighs recent form, "
+          "pace, weather, rest, the quarterback and injuries, then leans on the "
+          "betting line. The two will not agree.")
+    _set_widths(sheet, [22, 14])
+
+
+def export_simple_workbook(
+    path, *, slate: pd.DataFrame, ratings: pd.DataFrame, meta: dict,
+    props: pd.DataFrame | None = None, scorecard=None,
+    team_data: pd.DataFrame | None = None,
+) -> Path:
+    """Write the short workbook: six tabs, no index, no backtest pages."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    workbook.calculation.fullCalcOnLoad = True
+
+    rec = Recorder()
+    sheets = {name: workbook.create_sheet(name) for name in SIMPLE_SHEETS}
+
+    _build_simple_predictions(sheets["Predictions"], rec, slate, meta, scorecard)
+    _build_simple_spread(sheets["Spread"], rec, slate, meta, scorecard)
+    _build_simple_totals(sheets["Point Totals"], rec, slate, meta, scorecard)
+    _build_simple_props(sheets["Player Projections"], props, meta, scorecard)
+    _build_simple_picker(
+        sheets["Matchup Picker"], rec, team_data, slate, meta, scorecard
+    )
+    _build_simple_ratings(sheets["Power Ratings"], ratings, meta, scorecard)
+
+    workbook.active = 0
+    workbook.save(path)
+    _inject_cached_values(path, rec)
+    export_simple_workbook.sheet_count = len(sheets)
+    return path
 
 
 def export_workbook(

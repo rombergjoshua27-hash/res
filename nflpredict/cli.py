@@ -311,18 +311,21 @@ def cmd_predict(args) -> int:
         print(report.format_scorecard(scorecard))
 
     if not args.no_excel:
-        result, hit = cached_walk_forward(
-            features,
-            start_season=getattr(args, "start", None) or config.DEFAULT_BACKTEST_START,
-            use_market=not args.no_market,
-            market_blend=args.market_blend,
-            total_blend=args.total_blend,
-            use_qb_features=_qb_features_enabled(args),
-            refit="season",
-            quiet=args.quiet,
-        )
-        if not args.quiet and not hit:
-            print("\nBacktesting once so the workbook carries its own evidence ...")
+        result = None
+        if args.full:
+            result, hit = cached_walk_forward(
+                features,
+                start_season=getattr(args, "start", None)
+                or config.DEFAULT_BACKTEST_START,
+                use_market=not args.no_market,
+                market_blend=args.market_blend,
+                total_blend=args.total_blend,
+                use_qb_features=_qb_features_enabled(args),
+                refit="season",
+                quiet=args.quiet,
+            )
+            if not args.quiet and not hit:
+                print("\nBacktesting once so the workbook carries its own evidence ...")
         print("\n" + _write_workbook(
             enriched, season, week, args, predictor, totals, history,
             props, scorecard, result,
@@ -390,7 +393,7 @@ def _write_workbook(
     """Write the one workbook and return a line saying where it went."""
     from datetime import datetime
 
-    from .excel import export_workbook
+    from .excel import export_simple_workbook, export_workbook
 
     games = load_games(quiet=True)
     engine = EloEngine(use_qb=args.qb_adjustment)
@@ -416,22 +419,29 @@ def _write_workbook(
     path = Path(args.excel) if getattr(args, "excel", None) else (
         config.OUTPUT_DIR / f"nflpredict_{season}_wk{week:02d}.xlsx"
     )
-    export_workbook(
-        path,
-        slate=enriched,
-        ratings=ratings,
-        result=result,
-        meta=meta,
-        props=props,
-        scorecard=scorecard,
-        team_data=_team_table(games, ratings),
-    )
+    team_data = _team_table(games, ratings)
+
+    # Six tabs by default. The full version keeps the backtest evidence, the
+    # calibration table and the game log; most weeks nobody needs to re-read
+    # those, so they are behind --full rather than in the way.
+    if getattr(args, "full", False):
+        export_workbook(
+            path, slate=enriched, ratings=ratings, result=result, meta=meta,
+            props=props, scorecard=scorecard, team_data=team_data,
+        )
+        tabs = getattr(export_workbook, "sheet_count", 0)
+        extra = f" | {len(result.predictions):,} backtested games" if result else ""
+    else:
+        export_simple_workbook(
+            path, slate=enriched, ratings=ratings, meta=meta,
+            props=props, scorecard=scorecard, team_data=team_data,
+        )
+        tabs = getattr(export_simple_workbook, "sheet_count", 0)
+        extra = ""
+
     return (
         f"Workbook written to {path}\n"
-        f"  {getattr(export_workbook, 'sheet_count', 0)} tabs | {len(enriched)} games "
-        f"| {len(ratings)} teams | "
-        f"{len(result.predictions):,} backtested games" if result is not None
-        else f"Workbook written to {path}"
+        f"  {tabs} tabs | {len(enriched)} games | {len(ratings)} teams{extra}"
     )
 
 
@@ -756,6 +766,10 @@ def build_parser() -> argparse.ArgumentParser:
         "predict", parents=[common], help="predict a slate of games"
     )
     predict.add_argument("--season", type=int, help="season (default: current)")
+    predict.add_argument(
+        "--full", action="store_true",
+        help="write the full workbook: backtest, calibration and game log too",
+    )
     predict.add_argument("--week", type=int, help="week (default: next unplayed)")
     predict.add_argument(
         "--no-excel", action="store_true",
@@ -797,7 +811,8 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--end", type=int, default=None)
     export.add_argument("--refit", choices=("week", "season"), default="season")
     export.add_argument("-o", "--output", help="output path (default: out/*.xlsx)")
-    export.set_defaults(func=cmd_export)
+    # `export` is the full article by definition -- that is what it is for.
+    export.set_defaults(func=cmd_export, full=True)
 
     track = subparsers.add_parser(
         "track", parents=[common], help="grade this season's picks so far"
@@ -810,6 +825,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="pull the latest data and rebuild the workbook",
     )
     refresh.add_argument("--season", type=int, help="slate season (default: current)")
+    refresh.add_argument(
+        "--full", action="store_true",
+        help="write the full workbook: backtest, calibration and game log too",
+    )
     refresh.add_argument("--week", type=int, help="slate week (default: next unplayed)")
     refresh.add_argument("--start", type=int, default=config.DEFAULT_BACKTEST_START)
     refresh.add_argument("-o", "--output", dest="excel", help="workbook path")
