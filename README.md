@@ -223,7 +223,7 @@ returns the live scorecard.
 
 ## The Excel workbook
 
-`nflpredict predict` writes **seven tabs and nothing else** — the week, in the
+`nflpredict predict` writes **eight tabs and nothing else** — the week, in the
 order you would look at it:
 
 | Tab | What it holds |
@@ -233,12 +233,31 @@ order you would look at it:
 | **Point Totals** | How many points, and which side of the total it leans |
 | **Player Projections** | Projected passing, rushing and receiving yards |
 | **Matchup Picker** | Two dropdowns — pick any teams, everything recalculates |
+| **Betting Picks** | Every pick ranked, with what that confidence has actually been worth |
 | **Power Ratings** | Every team, strongest first |
 | **Last Week** | How the last slate's picks actually turned out, graded on all three markets |
 
 About 20 KB, a few seconds to build. Each tab carries its own one-line
 accuracy note at the foot, so no claim travels without the number it applies
 to. **Yellow cells are yours to edit**; everything else is a formula.
+
+### A note on the Betting Picks tab
+
+Straight-up picks carry the model's own probability, because that is the one
+number here that has been checked and holds up — a stated 70% really has won
+about 70%.
+
+Spread and total picks are rated a coin flip, because that is what nineteen
+seasons say they are: 49.6% and 50.8%, against the 52.38% needed to break
+even at -110. Rating them by how far the model sits from the line is
+tempting and wrong — the best-looking bucket is 60.9% **on twenty-three
+bets**. Those per-bucket rates are in `config.py` for anyone who wants them,
+but they do not survive their own sample sizes.
+
+The expected-value column is negative on essentially every row. That is the
+vig; it is the measured result rather than a disclaimer, and it is why a
+model that ties the closing line is a good forecast and still not a
+profitable bet.
 
 `nflpredict export`, or `predict --full`, writes the long version instead:
 the same six plus Start Here, Team Totals, Season Scorecard, Team Data,

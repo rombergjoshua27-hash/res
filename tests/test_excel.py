@@ -374,7 +374,7 @@ def test_the_simple_workbook_has_exactly_the_six_tabs(simple_workbook):
     """The point of this workbook is what it leaves out."""
     assert load_workbook(simple_workbook).sheetnames == [
         "Predictions", "Spread", "Point Totals", "Player Projections",
-        "Matchup Picker", "Power Ratings", "Last Week",
+        "Matchup Picker", "Betting Picks", "Power Ratings", "Last Week",
     ]
 
 
@@ -545,3 +545,90 @@ def test_last_week_is_empty_handed_gracefully(tmp_path, workbook_inputs):
     )
     sheet = load_workbook(path)["Last Week"]
     assert "No games" in str(sheet["A2"].value)
+
+
+# --------------------------------------------------------------------------
+# Betting Picks
+# --------------------------------------------------------------------------
+
+
+def _picks_rows(path):
+    sheet = load_workbook(path, data_only=True)["Betting Picks"]
+    rows = []
+    for r in range(5, 200):
+        market = sheet.cell(r, 1).value
+        if market not in ("Moneyline", "Spread", "Total"):
+            continue
+        rows.append(
+            {
+                "market": market,
+                "confidence": sheet.cell(r, 4).value,
+                "rating": sheet.cell(r, 5).value,
+                "ev": sheet.cell(r, 7).value,
+            }
+        )
+    return rows
+
+
+def test_every_game_gets_a_pick_in_all_three_markets(simple_workbook, workbook_inputs):
+    slate = workbook_inputs[0]
+    rows = _picks_rows(simple_workbook)
+    for market in ("Moneyline", "Spread", "Total"):
+        assert len([r for r in rows if r["market"] == market]) == len(slate)
+
+
+def test_picks_are_ranked_by_confidence(simple_workbook):
+    confidences = [r["confidence"] for r in _picks_rows(simple_workbook)]
+    assert confidences == sorted(confidences, reverse=True)
+
+
+def test_spread_and_total_picks_are_rated_a_coin_flip(simple_workbook):
+    """What nineteen seasons say they are, whatever the model's edge looks like."""
+    from nflpredict import config
+
+    rows = _picks_rows(simple_workbook)
+    for market, expected in (
+        ("Spread", config.ATS_BY_EDGE[-1][2]),
+        ("Total", config.OU_BY_EDGE[-1][2]),
+    ):
+        rated = [r["confidence"] for r in rows if r["market"] == market]
+        assert rated == pytest.approx([expected] * len(rated))
+        assert {r["rating"] for r in rows if r["market"] == market} == {"COIN FLIP"}
+
+
+def test_no_pick_is_given_a_positive_expected_value(simple_workbook):
+    """The guard against the tab inventing an edge it does not have.
+
+    An earlier version priced each pick off its calibration band's realised
+    rate. One band runs +4.6% against a neighbour at -1.8% -- alternating
+    signs, i.e. sampling noise -- and substituting that for a single game's
+    probability manufactured nine positive-EV bets out of nothing.
+    """
+    evs = [r["ev"] for r in _picks_rows(simple_workbook) if r["ev"] is not None]
+    assert evs
+    assert max(evs) < 0
+
+
+def test_the_moneyline_confidence_is_the_models_own_number(simple_workbook, workbook_inputs):
+    """Not a band average: the model is calibrated, so its own probability stands."""
+    slate = workbook_inputs[0]
+    expected = sorted(
+        (max(float(p), 1.0 - float(p)) for p in slate["prob_home"]), reverse=True
+    )
+    actual = sorted(
+        (r["confidence"] for r in _picks_rows(simple_workbook) if r["market"] == "Moneyline"),
+        reverse=True,
+    )
+    assert actual == pytest.approx(expected)
+
+
+def test_the_tab_states_the_breakeven_it_is_measured_against(simple_workbook):
+    sheet = load_workbook(simple_workbook)["Betting Picks"]
+    text = " ".join(
+        str(cell.value)
+        for row in sheet.iter_rows()
+        for cell in row
+        if isinstance(cell.value, str)
+    )
+    assert "52.38%" in text
+    assert "23" in text or "twenty-three" in text  # the small-sample warning
