@@ -374,7 +374,7 @@ def test_the_simple_workbook_has_exactly_the_six_tabs(simple_workbook):
     """The point of this workbook is what it leaves out."""
     assert load_workbook(simple_workbook).sheetnames == [
         "Predictions", "Spread", "Point Totals", "Player Projections",
-        "Matchup Picker", "Power Ratings",
+        "Matchup Picker", "Power Ratings", "Last Week",
     ]
 
 
@@ -448,3 +448,100 @@ def test_every_simple_tab_says_how_accurate_it_is(simple_workbook):
 def test_the_simple_workbook_stays_small(simple_workbook):
     """No game log means this should be kilobytes, not megabytes."""
     assert simple_workbook.stat().st_size < 400_000
+
+
+# --------------------------------------------------------------------------
+# Last Week
+# --------------------------------------------------------------------------
+
+
+def _graded_card(games, team_epa):
+    """A real scorecard for the most recent settled season."""
+    from nflpredict.backtest import track_season
+    from nflpredict.features import build_features
+
+    features = build_features(games, team_epa)
+    season = int(features[features["completed"]]["season"].max())
+    return track_season(features, season)
+
+
+@pytest.fixture(scope="module")
+def last_week_book(tmp_path_factory, workbook_inputs, games, team_epa):
+    from nflpredict.excel import export_simple_workbook
+
+    slate, ratings, team_data, props, meta = workbook_inputs
+    path = tmp_path_factory.mktemp("lastweek") / "book.xlsx"
+    export_simple_workbook(
+        path, slate=slate, ratings=ratings, team_data=team_data, props=props,
+        meta=meta, scorecard=_graded_card(games, team_epa),
+    )
+    return path
+
+
+def test_last_week_grades_all_three_markets(last_week_book):
+    """The winner, the spread and the total, on the same row.
+
+    The model can be right about who wins and wrong about both of the others
+    in the same game; a tab showing only the first would flatter it.
+    """
+    sheet = load_workbook(last_week_book, data_only=True)["Last Week"]
+    headers = [sheet.cell(4, c).value for c in range(1, 10)]
+    assert headers == [
+        "Away", "Home", "Score", "Picked", "Won?", "Spread", "Covered?",
+        "Total", "Over/under?",
+    ]
+
+
+def test_last_week_covers_exactly_one_week(last_week_book, games, team_epa):
+    card = _graded_card(games, team_epa)
+    expected = len(card.games[card.games["week"] == card.games["week"].max()])
+    sheet = load_workbook(last_week_book, data_only=True)["Last Week"]
+    rows = [r for r in range(5, 40) if sheet.cell(r, 1).value and sheet.cell(r, 4).value]
+    assert len(rows) == expected
+
+
+def test_last_week_grades_read_as_words(last_week_book):
+    sheet = load_workbook(last_week_book, data_only=True)["Last Week"]
+    verdicts = {
+        sheet.cell(r, 5).value
+        for r in range(5, 40)
+        if sheet.cell(r, 5).value is not None
+    }
+    assert verdicts <= {"WON", "LOST", "PUSH", ""}
+    assert verdicts & {"WON", "LOST"}
+
+
+def test_a_push_is_graded_as_neither(last_week_book):
+    """A spread landing exactly on the number is not a loss."""
+    from nflpredict.excel import _graded
+
+    assert _graded(1.0) == "WON"
+    assert _graded(0.0) == "LOST"
+    assert _graded(None) == ""
+    assert _graded(float("nan")) == ""
+
+
+def test_last_week_says_one_week_proves_nothing(last_week_book):
+    """Sixteen games is the sample most likely to be over-read."""
+    sheet = load_workbook(last_week_book)["Last Week"]
+    text = " ".join(
+        str(cell.value)
+        for row in sheet.iter_rows()
+        for cell in row
+        if isinstance(cell.value, str)
+    )
+    assert "66.6%" in text and "49.6%" in text
+
+
+def test_last_week_is_empty_handed_gracefully(tmp_path, workbook_inputs):
+    """A season with nothing settled yet must not break the workbook."""
+    from nflpredict.excel import export_simple_workbook
+
+    slate, ratings, team_data, props, meta = workbook_inputs
+    path = tmp_path / "empty.xlsx"
+    export_simple_workbook(
+        path, slate=slate, ratings=ratings, team_data=team_data,
+        props=props, meta=meta, scorecard=None,
+    )
+    sheet = load_workbook(path)["Last Week"]
+    assert "No games" in str(sheet["A2"].value)

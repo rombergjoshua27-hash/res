@@ -1632,7 +1632,7 @@ def _add_back_link(sheet) -> None:
 
 SIMPLE_SHEETS = (
     "Predictions", "Spread", "Point Totals", "Player Projections",
-    "Matchup Picker", "Power Ratings",
+    "Matchup Picker", "Power Ratings", "Last Week",
 )
 
 
@@ -1849,6 +1849,95 @@ def _build_simple_props(sheet, props, meta, scorecard, *, top: int = 20) -> None
     _set_widths(sheet, [24, 8, 7, 12, 14])
 
 
+def _build_simple_last_week(sheet, scorecard, meta) -> None:
+    """How the most recent slate's picks actually turned out, game by game.
+
+    The forward-looking tabs are a claim; this is the receipt. It grades all
+    three markets on the same row -- the winner, the spread and the total --
+    because the model can be right about who wins and wrong about both of the
+    others in the same game, and a tab that only showed the first would
+    flatter it.
+    """
+    sheet["A1"] = "Last Week"
+    sheet["A1"].font = _TITLE_FONT
+
+    games = getattr(scorecard, "games", None)
+    if games is None or games.empty:
+        sheet["A2"] = "No games have been settled yet this season."
+        sheet["A2"].font = _NOTE_FONT
+        _set_widths(sheet, [9, 9, 11, 9, 9, 11, 9, 11, 9])
+        return
+
+    week = int(games["week"].max())
+    played = games[games["week"] == week].copy()
+    played = played.sort_values("kickoff") if "kickoff" in played.columns else played
+
+    wins = float(played["hit"].sum())
+    ats_wins = float(played["ats_win"].sum(skipna=True))
+    ats_played = int(played["ats_win"].count())
+    ou_wins = float(played["ou_win"].sum(skipna=True))
+    ou_played = int(played["ou_win"].count())
+
+    sheet["A2"] = (
+        f"{int(scorecard.season)} Week {week}  ·  "
+        f"{wins:.0f} of {len(played)} straight up  ·  "
+        f"{ats_wins:.0f}-{ats_played - ats_wins:.0f} against the spread  ·  "
+        f"{ou_wins:.0f}-{ou_played - ou_wins:.0f} on totals"
+    )
+    sheet["A2"].font = _NOTE_FONT
+
+    row = 4
+    _write_header(
+        sheet, row,
+        ["Away", "Home", "Score", "Picked", "Won?", "Spread", "Covered?",
+         "Total", "Over/under?"],
+    )
+
+    first = row + 1
+    for offset, game in enumerate(played.itertuples(index=False), start=0):
+        r = first + offset
+        away_score = _num(getattr(game, "away_score", None))
+        home_score = _num(getattr(game, "home_score", None))
+
+        _value(sheet, r, 1, game.away_team)
+        _value(sheet, r, 2, game.home_team)
+        _value(
+            sheet, r, 3,
+            "" if away_score is None else f"{away_score:.0f}-{home_score:.0f}",
+        )
+        _value(sheet, r, 4, str(getattr(game, "pick", "")), font=_BOLD)
+        _value(sheet, r, 5, _graded(getattr(game, "hit", None), half="PUSH"))
+        _value(sheet, r, 6, _num(getattr(game, "market_spread", None)), SPREAD)
+        _value(sheet, r, 7, _graded(getattr(game, "ats_win", None)))
+        _value(sheet, r, 8, _num(getattr(game, "market_total", None)), "0.0")
+        ou_pick = str(getattr(game, "ou_pick", "-"))
+        ou = _graded(getattr(game, "ou_win", None))
+        _value(sheet, r, 9, "" if ou == "" else f"{ou_pick.title()} — {ou.lower()}")
+
+    last = first + len(played)
+    _note(sheet, last + 1,
+          "Spread and Total are the posted numbers. Covered and Over/under grade "
+          "the model's side of each; a push counts as neither.")
+    _note(sheet, last + 2,
+          "One week is sixteen games. Over 4,913 the model is right 66.6% of the "
+          "time straight up and 49.6% against the spread -- a good week is not "
+          "evidence it improved, and a bad one is not evidence it broke.")
+    _set_widths(sheet, [9, 9, 11, 9, 9, 10, 11, 9, 16])
+    sheet.freeze_panes = f"A{first}"
+
+
+def _graded(value, *, half: str = "") -> str:
+    """Turn a 1/0/NaN grade into something readable."""
+    if value is None or pd.isna(value):
+        return ""
+    value = float(value)
+    if value == 1.0:
+        return "WON"
+    if value == 0.0:
+        return "LOST"
+    return half or "PUSH"
+
+
 def _build_simple_ratings(sheet, ratings, meta, scorecard) -> None:
     """Every team, strongest first."""
     row = _simple_title(sheet, "Power Ratings", meta, scorecard)
@@ -2003,6 +2092,7 @@ def export_simple_workbook(
         sheets["Matchup Picker"], rec, team_data, slate, meta, scorecard
     )
     _build_simple_ratings(sheets["Power Ratings"], ratings, meta, scorecard)
+    _build_simple_last_week(sheets["Last Week"], scorecard, meta)
 
     workbook.active = 0
     workbook.save(path)
