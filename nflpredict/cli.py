@@ -20,12 +20,13 @@ import pandas as pd
 
 from . import config, report
 from .backtest import walk_forward
-from .data import load_games, load_team_game_epa
+from .data import load_games, load_half_scores, load_team_game_epa
 from .players import load_injuries, load_player_weeks
 from .edge import attach_edges
 from .elo import EloEngine
 from .features import build_features
 from .model import GamePredictor
+from .splits import SplitPredictor
 from .totals import TotalsPredictor
 
 __all__ = ["main"]
@@ -51,10 +52,12 @@ def _build(args) -> Tuple[pd.DataFrame, pd.DataFrame]:
         player_weeks = load_player_weeks(seasons, quiet=args.quiet)
         injuries = load_injuries(seasons, quiet=args.quiet)
 
+    halves = pd.DataFrame() if args.no_epa else load_half_scores(seasons, quiet=args.quiet)
+
     engine = EloEngine(use_qb=args.qb_adjustment)
     features = build_features(
         games, epa, elo_engine=engine,
-        player_weeks=player_weeks, injuries=injuries,
+        player_weeks=player_weeks, injuries=injuries, half_scores=halves,
     )
     # Fitting on passer terms that are structurally zero would teach the model
     # a coefficient it can never use, so the switch follows the data.
@@ -185,14 +188,24 @@ def _predict_slate(features: pd.DataFrame, season: int, week: int, args):
     merged = _attach(merged, totals.predict(slate))
     merged["actual_total"] = TotalsPredictor.actual_total(merged)
 
+    # Team totals and half lines are derived from the two full-game forecasts,
+    # so the calibration is fitted on how those forecasts landed historically.
+    calibration = history.copy()
+    calibration = _attach(calibration, winner.predict(calibration))
+    calibration = _attach(calibration, totals.predict(calibration))
+    splits = SplitPredictor().fit(calibration)
+    merged = _attach(merged, splits.predict(merged))
+
     enriched = attach_edges(merged).sort_values("pick_prob", ascending=False)
-    return enriched, winner, totals, history
+    return enriched, winner, totals, history, splits
 
 
 def cmd_predict(args) -> int:
     _, features = _build(args)
     season, week = _target_slate(features, args)
-    enriched, predictor, totals, history = _predict_slate(features, season, week, args)
+    enriched, predictor, totals, history, splits = _predict_slate(
+        features, season, week, args
+    )
 
     priced = int(enriched["market_spread"].notna().sum())
     title = (
@@ -203,6 +216,8 @@ def cmd_predict(args) -> int:
     print(report.format_slate(enriched, title=title))
     print()
     print(report.format_totals(enriched, sigma=totals.report.sigma))
+    print()
+    print(report.format_splits(enriched))
 
     if not args.no_excel:
         print("\n" + _write_slate_workbook(enriched, features, season, week, args,
@@ -355,7 +370,9 @@ def cmd_export(args) -> int:
     _, features = _build(args)
 
     season, week = _target_slate(features, args)
-    slate_out, predictor, totals, history = _predict_slate(features, season, week, args)
+    slate_out, predictor, totals, history, splits = _predict_slate(
+        features, season, week, args
+    )
 
     engine = EloEngine(use_qb=args.qb_adjustment)
     engine.run(load_games(quiet=args.quiet))

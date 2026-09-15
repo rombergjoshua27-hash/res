@@ -776,6 +776,76 @@ def _build_totals_slate(sheet, rec: Recorder, slate: pd.DataFrame, meta: dict) -
     sheet.freeze_panes = f"A{first}"
 
 
+def _build_team_totals(sheet, rec: Recorder, slate: pd.DataFrame, meta: dict) -> None:
+    """Per-team totals and the first-half split, derived from the game pair."""
+    row = _write_title(
+        sheet,
+        f"{meta['slate_season']} Week {meta['slate_week']} Team Totals and Halves",
+        "Each side's projected points, and the first-half split. Derived from "
+        "the game total and the spread, so the two team totals add to the game.",
+    )
+    _write_header(
+        sheet, row,
+        ["Away", "Home", "Away pts", "Home pts", "Game total", "Spread",
+         "1H total", "1H spread", "1H away", "1H home", "2H total",
+         "Actual away", "Actual home"],
+    )
+
+    first = row + 1
+    for offset, game in enumerate(slate.itertuples(index=False)):
+        r = first + offset
+        total = _num(getattr(game, "pred_total", None))
+        margin = _num(getattr(game, "pred_margin", None))
+        fh_total = _num(getattr(game, "first_half_total_pred", None))
+        fh_margin = _num(getattr(game, "first_half_margin_pred", None))
+
+        _value(sheet, r, 1, game.away_team)
+        _value(sheet, r, 2, game.home_team)
+        # The split is arithmetic, so it is written as arithmetic: edit the
+        # game total or the spread and both team totals follow.
+        rec.formula(
+            sheet, r, 3, f'=IF(OR($E{r}="",$F{r}=""),"",($E{r}-$F{r})/2)',
+            None if total is None or margin is None else (total - margin) / 2.0, "0.0",
+        )
+        rec.formula(
+            sheet, r, 4, f'=IF(OR($E{r}="",$F{r}=""),"",($E{r}+$F{r})/2)',
+            None if total is None or margin is None else (total + margin) / 2.0, "0.0",
+        )
+        _value(sheet, r, 5, total, "0.0")
+        _value(sheet, r, 6, margin, SPREAD)
+        _value(sheet, r, 7, fh_total, "0.0")
+        _value(sheet, r, 8, fh_margin, SPREAD)
+        rec.formula(
+            sheet, r, 9, f'=IF(OR($G{r}="",$H{r}=""),"",($G{r}-$H{r})/2)',
+            None if fh_total is None or fh_margin is None else (fh_total - fh_margin) / 2.0,
+            "0.0",
+        )
+        rec.formula(
+            sheet, r, 10, f'=IF(OR($G{r}="",$H{r}=""),"",($G{r}+$H{r})/2)',
+            None if fh_total is None or fh_margin is None else (fh_total + fh_margin) / 2.0,
+            "0.0",
+        )
+        rec.formula(
+            sheet, r, 11, f'=IF(OR($E{r}="",$G{r}=""),"",$E{r}-$G{r})',
+            None if total is None or fh_total is None else total - fh_total, "0.0",
+        )
+        _value(sheet, r, 12, _num(getattr(game, "away_score", None)), "0")
+        _value(sheet, r, 13, _num(getattr(game, "home_score", None)), "0")
+
+    last = first + len(slate)
+    _note(sheet, last + 1,
+          "Away pts and Home pts are formulas over Game total and Spread, so "
+          "editing either updates both. They add to the game total by construction.")
+    _note(sheet, last + 2,
+          "Walk-forward 2008-2026: team totals miss by 7.5 and 7.3 points against "
+          "8.1 for guessing the league average. The first-half total misses by 7.03 "
+          "against 7.22 for that same naive guess -- barely any edge. First halves "
+          "are mostly noise; the first-half side is right 60.7% of the time against "
+          "66.6% for the full game.")
+    _set_widths(sheet, [9, 9, 10, 10, 11, 9, 10, 10, 9, 9, 10, 12, 12])
+    sheet.freeze_panes = f"A{first}"
+
+
 def _build_totals_backtest(sheet, rec: Recorder, last_row: int, derived: pd.DataFrame) -> None:
     """Totals accuracy and over/under record, as live formulas over the Game Log."""
     row = _write_title(
@@ -894,6 +964,7 @@ _READ_ME = [
     ("head", "What is in here"),
     ("text", "Predictions -- the upcoming slate: pick, win probability, confidence tier, the model's spread against the posted line, and its fair moneyline against the posted price."),
     ("text", "Point Totals -- the same slate scored for points: the model's own total, the posted total, the blend of the two, and the over/under it implies."),
+    ("text", "Team Totals -- each side's projected points and the first-half split, derived from the game total and the spread."),
     ("text", "Power Ratings -- every franchise's current Elo, and what it is worth in points."),
     ("text", "Backtest Summary -- the model measured against the market, against Elo alone, and against simply picking the home team."),
     ("text", "Calibration -- whether a stated 70% actually wins 70% of the time."),
@@ -971,6 +1042,7 @@ SLATE_READ_ME = [
     ("head", "What is in here"),
     ("text", "Predictions -- pick, win probability, confidence tier, the model's spread against the posted line, and its fair moneyline against the posted price."),
     ("text", "Point Totals -- the model's own total, the posted total, the blend of the two, and the over/under it implies."),
+    ("text", "Team Totals -- each side's projected points and the first-half split, derived from the game total and the spread."),
     ("text", "Power Ratings -- every franchise's current Elo, and what it is worth in points."),
     ("blank", ""),
     ("head", "How accurate is it, honestly"),
@@ -999,12 +1071,16 @@ def export_slate_workbook(
     rec = Recorder()
     sheets = {
         name: workbook.create_sheet(name)
-        for name in ("Read Me", "Predictions", "Point Totals", "Power Ratings")
+        for name in (
+            "Read Me", "Predictions", "Point Totals", "Team Totals",
+            "Power Ratings",
+        )
     }
 
     _build_read_me(sheets["Read Me"], meta, content=SLATE_READ_ME)
     _build_predictions(sheets["Predictions"], rec, slate, meta)
     _build_totals_slate(sheets["Point Totals"], rec, slate, meta)
+    _build_team_totals(sheets["Team Totals"], rec, slate, meta)
     _build_ratings(sheets["Power Ratings"], rec, ratings)
 
     workbook.save(path)
@@ -1027,9 +1103,10 @@ def export_workbook(path, *, slate: pd.DataFrame, ratings: pd.DataFrame, result,
     sheets = {
         name: workbook.create_sheet(name)
         for name in (
-            "Read Me", "Predictions", "Point Totals", "Power Ratings",
-            "Backtest Summary", "Calibration", "Against the Spread",
-            "Point Totals Backtest", "Accuracy by Season", "Game Log",
+            "Read Me", "Predictions", "Point Totals", "Team Totals",
+            "Power Ratings", "Backtest Summary", "Calibration",
+            "Against the Spread", "Point Totals Backtest",
+            "Accuracy by Season", "Game Log",
         )
     }
 
@@ -1047,6 +1124,7 @@ def export_workbook(path, *, slate: pd.DataFrame, ratings: pd.DataFrame, result,
     _build_read_me(sheets["Read Me"], meta)
     _build_predictions(sheets["Predictions"], rec, slate, meta)
     _build_totals_slate(sheets["Point Totals"], rec, slate, meta)
+    _build_team_totals(sheets["Team Totals"], rec, slate, meta)
     _build_ratings(sheets["Power Ratings"], rec, ratings)
     _build_summary(sheets["Backtest Summary"], rec, last_row, derived, meta)
     _build_calibration(sheets["Calibration"], rec, last_row, derived)

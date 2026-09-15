@@ -23,6 +23,7 @@ from nflpredict.edge import attach_edges
 from nflpredict.excel import _derive, export_workbook
 from nflpredict.features import build_features
 from nflpredict.model import GamePredictor
+from nflpredict.splits import SplitPredictor
 from nflpredict.totals import TotalsPredictor
 
 
@@ -45,6 +46,25 @@ def workbook(tmp_path_factory, games, team_epa):
         slate = slate.drop(columns=clashes).merge(payload, on="game_id", how="left")
     slate["actual_total"] = TotalsPredictor.actual_total(slate)
     slate = attach_edges(slate)
+
+    calibration = history.copy()
+    for predictions in (
+        GamePredictor().fit(history).predict(calibration),
+        TotalsPredictor().fit(history).predict(calibration),
+    ):
+        payload = predictions.drop(columns=["game_id"]).assign(
+            game_id=predictions["game_id"].values
+        )
+        clashes = [
+            c for c in payload.columns if c != "game_id" and c in calibration.columns
+        ]
+        calibration = calibration.drop(columns=clashes).merge(
+            payload, on="game_id", how="left"
+        )
+    splits = SplitPredictor().fit(calibration).predict(slate)
+    slate = slate.drop(
+        columns=[c for c in splits.columns if c != "game_id" and c in slate.columns]
+    ).merge(splits, on="game_id", how="left")
 
     engine_ratings = pd.DataFrame(
         {"team": ["KC", "BUF"], "elo": [1650.0, 1600.0], "spread_vs_average": [6.0, 4.0]}
@@ -73,9 +93,10 @@ def workbook(tmp_path_factory, games, team_epa):
 def test_workbook_has_every_expected_sheet(workbook):
     path, _ = workbook
     assert load_workbook(path).sheetnames == [
-        "Read Me", "Predictions", "Point Totals", "Power Ratings",
-        "Backtest Summary", "Calibration", "Against the Spread",
-        "Point Totals Backtest", "Accuracy by Season", "Game Log",
+        "Read Me", "Predictions", "Point Totals", "Team Totals",
+        "Power Ratings", "Backtest Summary", "Calibration",
+        "Against the Spread", "Point Totals Backtest",
+        "Accuracy by Season", "Game Log",
     ]
 
 

@@ -296,6 +296,7 @@ def build_features(
     elo_engine: EloEngine | None = None,
     player_weeks: pd.DataFrame | None = None,
     injuries: pd.DataFrame | None = None,
+    half_scores: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Attach Elo, rolling-form and market columns to every game.
 
@@ -375,6 +376,8 @@ def build_features(
     out = out.merge(qb_frame, on="game_id", how="left")
     out = out.merge(availability, on="game_id", how="left")
 
+    _attach_half_scores(out, half_scores)
+
     out["market_spread"] = out["spread_line"].astype(float)
     out["has_market"] = out["market_spread"].notna().astype(float)
     out["market_total"] = out["total_line"].astype(float)
@@ -384,6 +387,28 @@ def build_features(
         out[column] = pd.to_numeric(out[column], errors="coerce").fillna(0.0)
 
     return out
+
+
+def _attach_half_scores(out: pd.DataFrame, half_scores: pd.DataFrame | None) -> None:
+    """Attach the actual halftime result, in place.
+
+    These are outcomes, not features -- nothing is fitted on them and no
+    model reads them as an input. They are the targets the first-half
+    calibration is measured against, and they are NaN until a game is played.
+    """
+    if half_scores is None or half_scores.empty:
+        out["home_first_half"] = np.nan
+        out["away_first_half"] = np.nan
+    else:
+        columns = ["game_id", "home_first_half", "away_first_half"]
+        merged = out[["game_id"]].merge(
+            half_scores[columns].drop_duplicates("game_id"), on="game_id", how="left"
+        )
+        out["home_first_half"] = merged["home_first_half"].to_numpy()
+        out["away_first_half"] = merged["away_first_half"].to_numpy()
+
+    out["first_half_total"] = out["home_first_half"] + out["away_first_half"]
+    out["first_half_margin"] = out["home_first_half"] - out["away_first_half"]
 
 
 # --------------------------------------------------------------------------

@@ -12,8 +12,8 @@ import pandas as pd
 from . import config
 
 __all__ = [
-    "format_slate", "format_totals", "format_backtest", "format_ratings",
-    "HONESTY_NOTE", "TOTALS_NOTE",
+    "format_slate", "format_totals", "format_splits", "format_backtest",
+    "format_ratings", "HONESTY_NOTE", "TOTALS_NOTE", "SPLITS_NOTE",
 ]
 
 HONESTY_NOTE = (
@@ -30,6 +30,17 @@ TOTALS_NOTE = (
     "the closing total misses by 10.47. Blending the two lands at 10.46 -- a\n"
     "tie, not an edge. Over/under picks hit 50.8%, under the 52.38% needed to\n"
     "break even at -110."
+)
+
+SPLITS_NOTE = (
+    "Team totals and half lines are derived from the game total and the spread,\n"
+    "not modelled separately -- a team total is not free to disagree with them.\n"
+    "Walk-forward over 2008-2026 (4,912 games) the team totals miss by 7.5 and\n"
+    "7.3 points against 8.1 for guessing the league average, so they carry real\n"
+    "information. The first-half total misses by 7.03 against 7.22 for that same\n"
+    "naive guess -- barely any edge at all. First halves are mostly noise, and\n"
+    "the first-half side is picked correctly 60.7% of the time against 66.6% for the\n"
+    "full game."
 )
 
 _RULE = "-" * 78
@@ -168,6 +179,40 @@ def _tier_label(confidence: float) -> str:
         if confidence >= threshold:
             return label
     return "COINFLIP"
+
+
+def format_splits(frame: pd.DataFrame) -> str:
+    """Render team totals and first-half lines for one slate."""
+    if frame.empty or "home_team_total" not in frame.columns:
+        return "No team totals available for this slate."
+
+    ordered = frame.sort_values("pred_total", ascending=False)
+    lines = [_RULE, "TEAM TOTALS AND FIRST HALF", _RULE]
+    header = (
+        f"{'MATCHUP':<20}{'AWAY':>7}{'HOME':>7}{'GAME':>8}"
+        f"{'1H TOT':>9}{'1H SPR':>9}{'2H TOT':>9}"
+    )
+    lines += [header, "-" * len(header)]
+
+    for row in ordered.itertuples(index=False):
+        matchup = f"{row.away_team} @ {row.home_team}"
+        lines.append(
+            f"{matchup:<20}"
+            f"{getattr(row, 'away_team_total', np.nan):>7.1f}"
+            f"{getattr(row, 'home_team_total', np.nan):>7.1f}"
+            f"{getattr(row, 'pred_total', np.nan):>8.1f}"
+            f"{getattr(row, 'first_half_total_pred', np.nan):>9.1f}"
+            f"{_fmt_signed(getattr(row, 'first_half_margin_pred', np.nan), 6):>9}"
+            f"{getattr(row, 'second_half_total_pred', np.nan):>9.1f}"
+        )
+
+    lines.append(_RULE)
+    lines += [
+        "AWAY/HOME are each side's projected points; they add to GAME by",
+        "construction. 1H SPR is the first-half spread from the home side.",
+        "", SPLITS_NOTE, _RULE,
+    ]
+    return "\n".join(lines)
 
 
 def format_backtest(result, *, label: str = "WALK-FORWARD BACKTEST") -> str:
