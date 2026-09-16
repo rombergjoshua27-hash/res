@@ -233,7 +233,7 @@ order you would look at it:
 | **Point Totals** | How many points, and which side of the total it leans |
 | **Player Projections** | Projected passing, rushing and receiving yards |
 | **Matchup Picker** | Two dropdowns — pick any teams, everything recalculates |
-| **Betting Picks** | Every pick ranked, with what that confidence has actually been worth |
+| **Betting Picks** | Every pick ranked within its market, with what that confidence has actually been worth |
 | **Power Ratings** | Every team, strongest first |
 | **Last Week** | How the last slate's picks actually turned out, graded on all three markets |
 
@@ -244,19 +244,44 @@ to. **Yellow cells are yours to edit**; everything else is a formula.
 ### A note on the Betting Picks tab
 
 Straight-up picks carry the model's own probability, because that is the one
-number here that has been checked and holds up — a stated 70% really has won
-about 70%.
+number here that has been checked and holds up — a stated 70% has won 76%
+and a stated 80% has won 87% across 4,912 games.
 
-Spread and total picks are rated a coin flip, because that is what nineteen
-seasons say they are: 49.6% and 50.8%, against the 52.38% needed to break
-even at -110. Rating them by how far the model sits from the line is
-tempting and wrong — the best-looking bucket is 60.9% **on twenty-three
-bets**. Those per-bucket rates are in `config.py` for anyone who wants them,
-but they do not survive their own sample sizes.
+Spread and total picks are ranked by **Edge**: how far the model's own
+unblended number sits from the posted line. An earlier version rated every
+one of them at the global base rate, so sixteen spreads all read 49.6% and
+there was nothing to choose between them. That was useless for a fixable
+reason — the rating was built off the *blended* forecast, which is
+deliberately pulled onto the market and so disagrees with it by at most four
+points. The unblended model disagrees by up to twenty-one, and that spread of
+disagreement is a real per-game quantity worth ranking on.
 
-The expected-value column is negative on essentially every row. That is the
-vig; it is the measured result rather than a disclaimer, and it is why a
-model that ties the closing line is a good forecast and still not a
+What the ranking does not claim is that it beats the price. Fitting win rate
+on edge gives a positive slope for both markets and a confidence interval
+that contains zero for both:
+
+| Market | Slope per point of edge | 95% CI | n |
+|---|---|---|---|
+| Totals | +0.0288 | −0.0012 … +0.0563 | 4,853 |
+| Spreads | +0.0086 | −0.0186 … +0.0369 | 4,788 |
+
+Twenty cuts of the data — early weeks, late weeks, big totals, small totals,
+home side, away side, each era — were checked and **not one clears the 52.38%
+needed at -110** with any confidence. The largest edges are suggestive: 6+
+points has won 53.8% on totals and 54.0% on spreads, but on 263–277 bets,
+where the margin for error is about three points of win rate either way.
+
+So `Win %` is fitted and then **capped at break-even**. Uncapped the curve
+quotes 56% on a big edge, which would have the tab advertising profitable
+bets on the strength of a relationship it cannot demonstrate — it did exactly
+that for one commit, and the test forbidding a positive expected value caught
+it. The measured band rate is still printed raw beside each pick, sample size
+and all, so where the realised rate runs past that ceiling you can see it and
+see what it rests on.
+
+The expected-value column is therefore negative on essentially every row.
+That is the vig; it is the measured result rather than a disclaimer, and it
+is why a model that ties the closing line is a good forecast and still not a
 profitable bet.
 
 `nflpredict export`, or `predict --full`, writes the long version instead:

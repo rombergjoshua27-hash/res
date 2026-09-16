@@ -20,6 +20,7 @@ stale cached value cannot survive being looked at.
 
 from __future__ import annotations
 
+import math
 import re
 import shutil
 import zipfile
@@ -1968,33 +1969,73 @@ def _ev(probability: float, odds: float | None) -> float | None:
     return probability * payout - (1.0 - probability)
 
 
+def _conviction(edge: float) -> str:
+    """How far the model sits from the posted number, as a word.
+
+    This labels the size of the disagreement and nothing else. A BIG edge
+    means the model and the market are six or more points apart; it is not a
+    claim that the pick wins more often, because the measured slope behind
+    that claim contains zero.
+    """
+    for threshold, label in config.CONVICTION_TIERS:
+        if abs(edge) >= threshold:
+            return label
+    return "NONE"
+
+
+def _edge_probability(edge: float, fit: tuple) -> float:
+    """Calibrated win probability for a pick with ``edge`` points of edge.
+
+    Fitted on the walk-forward, then clamped at ``CONVICTION_CAP`` because the
+    fits were estimated over edges that are almost entirely under twelve
+    points and should not be extrapolated past what was measured.
+    """
+    intercept, slope = fit
+    raw = 1.0 / (1.0 + math.exp(-(intercept + slope * abs(edge))))
+    return min(raw, config.CONVICTION_CAP)
+
+
+def _edge_band(edge: float, bands) -> tuple:
+    """The measured band covering ``edge``: (sample size, realised rate)."""
+    for lower, games, rate in bands:
+        if abs(edge) >= lower:
+            return games, rate
+    return bands[-1][1], bands[-1][2]
+
+
 def _build_simple_picks(sheet, rec: Recorder, slate, meta, scorecard) -> None:
-    """Every pick this week, ranked by how much confidence it has earned.
+    """Every pick this week, ranked within its own market.
 
-    Two deliberate choices about what "confidence" means here.
+    Three markets, rated on three different footings, because they have
+    earned three different amounts of trust.
 
-    *Straight-up picks carry the model's own probability*, because that is
-    the one number in this project that has been checked and holds up: a
-    stated 70% really has won about 70% across 4,912 games. The expected
-    value beside it uses that probability against the posted price.
+    *Straight-up picks carry the model's own probability.* That number has
+    been checked and holds: a stated 70% has won 76% and a stated 80% has won
+    87% across 4,912 games. It is the one place in this project where a
+    confident number means what it says.
 
-    *Spread and total picks are rated a coin flip*, because that is what
-    nineteen seasons say they are -- 49.6% and 50.8%, against the 52.38%
-    needed to break even. It is tempting to rate them by how far the model
-    sits from the line, and the per-bucket rates are in ``config`` for
-    anyone who wants them, but the buckets do not survive their own sample
-    sizes: the best-looking one is 60.9% on twenty-three bets. Rating a pick
-    by a bucket like that would be inventing confidence, which is the one
-    thing a tab called Betting Picks must not do.
+    *Spread and total picks are rated by how far the model's own unblended
+    number sits from the posted line.* An earlier version of this tab rated
+    every one of them at the global base rate, so sixteen spreads all read
+    49.6% and there was nothing to choose between them. That was useless, and
+    it was useless for a fixable reason: the rating was built off the blended
+    forecast, which is deliberately pulled onto the market and therefore
+    disagrees with it by at most four points. The unblended model disagrees by
+    up to twenty-one, and that spread of disagreement is a real, per-game,
+    measured quantity worth ranking on.
+
+    *What the ranking does not claim is that it beats the price.* The fitted
+    slope of win rate on edge is positive for both markets and its confidence
+    interval contains zero in both. Twenty different cuts of the data --
+    early weeks, late weeks, big totals, small totals, home side, away side,
+    each era -- were checked and not one of them clears the 52.38% needed at
+    -110 with any confidence. So the picks are ordered honestly and the EV
+    column still comes out negative, and both of those things are the
+    measurement rather than a disclaimer.
     """
     row = _simple_title(sheet, "Betting Picks", meta, scorecard)
 
-    ats_rate = config.ATS_BY_EDGE[-1][2]
-    ou_rate = config.OU_BY_EDGE[-1][2]
-    vig_ev = _ev(ats_rate, config.STANDARD_VIG_ODDS)
-    ou_ev = _ev(ou_rate, config.STANDARD_VIG_ODDS)
-
-    entries = []
+    moneyline, spreads, totals = [], [], []
     for game in slate.itertuples(index=False):
         matchup = f"{game.away_team} @ {game.home_team}"
 
@@ -2003,71 +2044,116 @@ def _build_simple_picks(sheet, rec: Recorder, slate, meta, scorecard) -> None:
         picked = game.home_team if prob >= 0.5 else game.away_team
         games, realised = _band_rate(confidence)
         odds = _num(getattr(game, "pick_odds", None))
-        entries.append((
-            confidence, "Moneyline", matchup, picked, confidence,
-            f"{realised:.0%} over {games:,} games", _ev(confidence, odds),
+        moneyline.append((
+            confidence, matchup, picked, None, None, None, confidence,
+            _simple_tier(confidence), f"{realised:.0%} over {games:,} games",
+            _ev(confidence, odds),
         ))
 
         line = _num(getattr(game, "market_spread", None))
-        model = _num(getattr(game, "pred_margin", None))
+        model = _num(getattr(game, "model_margin", None))
         if line is not None and model is not None:
-            side = game.home_team if model > line else game.away_team
-            number = line if side == game.home_team else -line
-            entries.append((
-                ats_rate, "Spread", matchup, f"{side} {number:+.1f}", ats_rate,
-                f"{ats_rate:.1%} over 4,912 games", vig_ev,
+            edge = model - line
+            side = game.home_team if edge > 0 else game.away_team
+            # market_spread is the home team's expected margin, so a home
+            # favourite carries a positive line and is laid at the negative of
+            # it. Writing the line straight through inverts every pick on the
+            # tab -- it printed "MIA -13.5" for a thirteen-point underdog --
+            # and the sign is the whole meaning of a spread.
+            number = -line if side == game.home_team else line
+            conf = _edge_probability(edge, config.ATS_EDGE_FIT)
+            n, rate = _edge_band(edge, config.ATS_BY_MODEL_EDGE)
+            spreads.append((
+                abs(edge), matchup, f"{side} {number:+.1f}", model, line, edge,
+                conf, _conviction(edge), f"{rate:.1%} over {n:,} bets",
+                _ev(conf, config.STANDARD_VIG_ODDS),
             ))
 
         total_line = _num(getattr(game, "market_total", None))
-        projection = _num(getattr(game, "pred_total", None))
+        projection = _num(getattr(game, "model_total", None))
         if total_line is not None and projection is not None:
-            side = "Over" if projection > total_line else "Under"
-            entries.append((
-                ou_rate, "Total", matchup, f"{side} {total_line:.1f}", ou_rate,
-                f"{ou_rate:.1%} over 4,912 games", ou_ev,
+            edge = projection - total_line
+            side = "Over" if edge > 0 else "Under"
+            conf = _edge_probability(edge, config.OU_EDGE_FIT)
+            n, rate = _edge_band(edge, config.OU_BY_MODEL_EDGE)
+            totals.append((
+                abs(edge), matchup, f"{side} {total_line:.1f}", projection,
+                total_line, edge, conf, _conviction(edge),
+                f"{rate:.1%} over {n:,} bets",
+                _ev(conf, config.STANDARD_VIG_ODDS),
             ))
 
-    entries.sort(key=lambda entry: entry[0], reverse=True)
+    for group in (moneyline, spreads, totals):
+        group.sort(key=lambda entry: entry[0], reverse=True)
 
     _write_header(
         sheet, row,
-        ["Market", "Game", "Pick", "Confidence", "Rating",
-         "What that has been worth", "EV per $1"],
+        ["Market", "Game", "Pick", "Model", "Line", "Edge", "Win %",
+         "Rating", "What that has been worth", "EV per $1"],
     )
 
     first = row + 1
-    for offset, entry in enumerate(entries):
-        _, market, matchup, pick, confidence, realised, ev = entry
-        r = first + offset
-        _value(sheet, r, 1, market)
-        _value(sheet, r, 2, matchup)
-        _value(sheet, r, 3, pick, font=_BOLD)
-        _value(sheet, r, 4, confidence, PCT)
-        _value(sheet, r, 5, _simple_tier(confidence))
-        _value(sheet, r, 6, realised)
-        _value(sheet, r, 7, ev, "+0.000;-0.000")
+    r = first
+    for label, group, fmt in (
+        ("Moneyline", moneyline, None),
+        ("Spread", spreads, SPREAD),
+        ("Total", totals, "0.0"),
+    ):
+        for entry in group:
+            _, matchup, pick, model, line, edge, conf, rating, realised, ev = entry
+            _value(sheet, r, 1, label)
+            _value(sheet, r, 2, matchup)
+            _value(sheet, r, 3, pick, font=_BOLD)
+            if model is not None:
+                _value(sheet, r, 4, model, fmt)
+                _value(sheet, r, 5, line, fmt)
+                _value(sheet, r, 6, edge, SPREAD)
+            _value(sheet, r, 7, conf, PCT)
+            _value(sheet, r, 8, rating)
+            _value(sheet, r, 9, realised)
+            _value(sheet, r, 10, ev, "+0.000;-0.000")
+            r += 1
 
-    last = first + len(entries)
+    last = r
     _note(sheet, last + 1,
-          "Straight-up picks carry the model's own probability, because that is "
-          "the number that has been checked and holds: a stated 70% really has "
-          "won about 70%. EV is that probability against the posted price.")
+          "Each market is ranked within itself. Straight-up picks carry the "
+          "model's own probability, which has been checked and holds: a stated "
+          "70% has won 76% across 4,912 games.")
     _note(sheet, last + 2,
-          "Spread and total picks are rated a coin flip, because that is what "
-          f"nineteen seasons say they are -- {ats_rate:.1%} and {ou_rate:.1%} "
-          f"against the {config.BREAKEVEN_AT_STANDARD_VIG:.2%} needed to break "
-          "even at -110.")
+          "Spread and total picks are ranked by Edge -- how far the model's own "
+          "number sits from the posted line. That is a real per-game quantity "
+          "and it is what makes one pick rank above another here.")
     _note(sheet, last + 3,
-          "Rating them by how far the model sits from the line is tempting and "
-          "wrong: the best-looking bucket is 60.9% on twenty-three bets. Those "
-          "per-bucket rates are in config.py for anyone who wants them, but they "
-          "do not survive their own sample sizes.")
+          "Rating describes the size of that disagreement, not the odds of "
+          "winning. BIG means six points or more apart; it does not mean six "
+          "points of profit.")
     _note(sheet, last + 4,
-          "EV is negative on nearly every row. That is the vig, it is the "
-          "measured result rather than a disclaimer, and it is why a model that "
-          "ties the closing line is a good forecast and still not a profitable "
-          "bet.")
-    _set_widths(sheet, [11, 16, 18, 12, 12, 24, 11])
+          "Model and Line are both the home team's margin, so they subtract "
+          "cleanly into Edge. The Pick column is in normal betting notation, "
+          "where a favourite is laid at a minus number.")
+    _note(sheet, last + 5,
+          "Win % is fitted on nineteen seasons and then capped at "
+          f"{config.CONVICTION_CAP:.2%}, the break-even price at -110. The fit "
+          "would quote 56% on a large edge, and the slope behind it cannot be "
+          "told apart from zero, so this tab will not advertise a profitable "
+          "bet on the strength of it.")
+    _note(sheet, last + 6,
+          "Where the measured column runs past the capped Win % -- a 6+ point "
+          "edge has won 53.8% -- that is the raw realised rate, printed with "
+          "its sample size so the gap is visible. On 277 bets its margin for "
+          "error is about three points either way, which is why it is shown "
+          "and not banked.")
+    _note(sheet, last + 7,
+          "The honest caveat: bigger edges have won slightly more often, and "
+          "the confidence interval on that slope contains zero for both "
+          "markets. Twenty cuts of the data were checked and none clears the "
+          f"{config.BREAKEVEN_AT_STANDARD_VIG:.2%} needed at -110. Rank these "
+          "picks against each other, not against the price.")
+    _note(sheet, last + 8,
+          "EV stays negative on nearly every row. That is the vig, measured "
+          "rather than assumed, and it is why a model that ties the closing "
+          "line is a good forecast and still not a profitable bet.")
+    _set_widths(sheet, [11, 16, 18, 9, 9, 9, 9, 12, 24, 11])
     sheet.freeze_panes = f"A{first}"
 
 
