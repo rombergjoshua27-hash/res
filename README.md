@@ -551,7 +551,11 @@ of downloading to discover nothing had happened.
 **It also runs itself**, so week to week there is nothing to do.
 
 `.github/workflows/refresh.yml` rebuilds the workbook every morning at 11:00
-UTC and publishes it two ways:
+UTC, plus a second run Sundays at 15:00 UTC (11am Eastern, roughly two hours
+before the early slate) to pick up the weekend's line movement and fold in
+Thursday's result before kickoff. Note that the injury layer reads the weekly
+injury report, which is final on Friday — the Sunday run buys a fresher
+market, not gameday inactives. Both publish two ways:
 
 - **[nflpredict-latest.xlsx](../../releases/download/latest/nflpredict-latest.xlsx)**
   on the `latest` release — a fixed filename, so this link always serves the

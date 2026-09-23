@@ -1,15 +1,28 @@
 name: Refresh workbook
 
-# Runs every morning. Scores, closing lines, listed quarterbacks and the
-# injury report all move during a week, so a daily rebuild keeps the workbook
-# current without anyone asking for it. The schedule also rolls the slate
-# forward on its own: once a week is mostly played, the model starts
-# predicting the next one.
+# Runs every morning, and once more on Sunday before the early slate. Scores,
+# closing lines, listed quarterbacks and the injury report all move during a
+# week, so a daily rebuild keeps the workbook current without anyone asking.
+# The schedule also rolls the slate forward on its own: once a week is mostly
+# played, the model starts predicting the next one.
 on:
   schedule:
     # 11:00 UTC daily — after nflverse has published the overnight update,
     # early enough to be there before the morning on either US coast.
     - cron: "0 11 * * *"
+    # 15:00 UTC Sunday — 11am Eastern, about two hours before the early slate.
+    # The daily run fires at 7am Eastern, which is before the Sunday market has
+    # really moved; most of a weekend's line movement happens in the hours
+    # either side of it. This second run exists to catch that, and to fold in
+    # Thursday's result (and a Saturday one, later in the season) before the
+    # games it is predicting kick off.
+    #
+    # It does NOT add gameday inactives. The feed behind the injury layer is
+    # the weekly injury report -- Out, Doubtful, Questionable -- which is final
+    # on Friday, not the 90-minutes-to-kickoff inactive list, which nothing
+    # here consumes. What this run buys is a fresher market, not a fresher
+    # roster.
+    - cron: "0 15 * * 0"
   workflow_dispatch:
     inputs:
       season:
@@ -99,7 +112,7 @@ jobs:
           if ! gh release view latest >/dev/null 2>&1; then
             gh release create latest \
               --title "Latest workbook" \
-              --notes "Rebuilt automatically every morning."
+              --notes "Rebuilt automatically every morning, and again on Sunday before kickoff."
           fi
           gh release upload latest "nflpredict-latest.xlsx" --clobber
 
@@ -121,7 +134,7 @@ jobs:
           Currently: **${{ steps.workbook.outputs.name }}**
           Rebuilt: $(date -u '+%Y-%m-%d %H:%M UTC')
 
-          Rebuilt every morning at 11:00 UTC. The slate rolls forward on its own once a week is mostly played, and results are graded on the Season Scorecard tab as they land.
+          Rebuilt every morning at 11:00 UTC, and again Sundays at 15:00 UTC before the early slate. The slate rolls forward on its own once a week is mostly played, and results are graded on the Season Scorecard tab as they land.
           NOTES
           )"
 
