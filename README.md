@@ -239,7 +239,26 @@ order you would look at it:
 
 About 20 KB, a few seconds to build. Each tab carries its own one-line
 accuracy note at the foot, so no claim travels without the number it applies
-to. **Yellow cells are yours to edit**; everything else is a formula.
+to. **Amber cells are yours to edit**; everything else is a formula.
+
+### How it looks
+
+The workbook is styled rather than merely populated: gridlines off, a solid
+header band, alternate rows striped, and Calibri throughout so it renders as
+designed on Excel desktop and mobile alike.
+
+Colour is used for two jobs and no others. The ordered tiers (BIG / MODERATE /
+SLIGHT, HIGH / MEDIUM / LEAN) run down a single blue ramp, because they encode
+*more and less of one thing*, not different kinds of thing. Settled results take
+the reserved green and red — and because red and green are exactly the pair a
+colourblind reader cannot separate, the colour never carries the answer: the
+cell reads `WON` or `LOST` in words and the tint only reinforces it.
+
+Everything used as type clears 4.5:1 against the surface it actually sits on —
+the striped fill or the status tint, not an assumed white. Two lighter steps of
+the ramp measure 4.42 and 2.99 on white and so appear as fills only, never as
+text. The Confidence column is coloured by conditional-formatting rule rather
+than a fixed font, so the colour follows the value if anything recalculates.
 
 ### A note on the Betting Picks tab
 

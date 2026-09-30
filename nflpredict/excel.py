@@ -33,6 +33,7 @@ import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill
 from openpyxl.styles.borders import Side
+from openpyxl.formatting.rule import CellIsRule
 from openpyxl.worksheet.hyperlink import Hyperlink
 from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
@@ -41,18 +42,91 @@ from . import config
 
 __all__ = ["export_workbook", "export_simple_workbook"]
 
-FONT = "Arial"
+# --------------------------------------------------------------------------
+# Palette
+# --------------------------------------------------------------------------
+#
+# Every colour here was picked for a role and then checked, because a
+# spreadsheet is read, and a colour that cannot be read is decoration.
+#
+# The ordered tiers (BIG / MODERATE / SLIGHT, HIGH / MEDIUM / LEAN) are a
+# *sequential* ramp -- one hue, light to dark -- because they encode magnitude,
+# not identity. Categorical hues would imply the tiers are different kinds of
+# thing rather than more and less of one thing.
+#
+# WON and LOST take the reserved status colours. Those are red and green, which
+# no amount of stepping makes safe for a red-green viewer, so the colour is
+# never what carries the answer: the cell reads "WON" or "LOST" in words, and
+# the colour is reinforcement. Same rule for the amber input cells.
+#
+# Everything used as text clears 4.5:1 against the surface it actually sits on
+# -- the banded fill or the status tint, not an assumed white. The lighter steps
+# of the ramp (#2a78d6, #5598e7) measure 4.42 and 2.99 on white and so appear
+# only as fills, never as type.
 
-_HEADER_FILL = PatternFill("solid", fgColor="1F3864")
-_HEADER_FONT = Font(name=FONT, size=10, bold=True, color="FFFFFF")
-_TITLE_FONT = Font(name=FONT, size=14, bold=True, color="1F3864")
-_SECTION_FONT = Font(name=FONT, size=11, bold=True, color="1F3864")
-_NOTE_FONT = Font(name=FONT, size=9, italic=True, color="606060")
-_BODY_FONT = Font(name=FONT, size=10)
-_BOLD = Font(name=FONT, size=10, bold=True)
-_INPUT_FONT = Font(name=FONT, size=10, color="0000FF")
-_ASSUMPTION_FILL = PatternFill("solid", fgColor="FFFF00")
-_BORDER = Border(bottom=Side(style="thin", color="BFBFBF"))
+_INK = "1A1A19"            # body text
+_INK_SOFT = "52514E"       # subtitles, secondary labels
+_INK_MUTED = "6B6B66"      # the "no edge" tier, disabled-ish text
+_SURFACE_BAND = "F5F8FD"   # zebra stripe, a whisper of the brand hue
+_RULE = "E3E8EF"           # hairlines
+
+_BRAND = "104281"          # header bands, titles      9.9:1 on white
+_BRAND_MID = "1C5CAB"      # second tier               6.6:1
+_BRAND_LIGHT = "256ABF"    # third tier                5.4:1
+
+_GOOD = "057005"           # WON text      5.6:1 on its tint
+_GOOD_TINT = "E6F6E6"
+_BAD = "B83232"            # LOST text     5.1:1 on its tint
+_BAD_TINT = "FBEAEA"
+_AMBER = "7A601B"          # editable text 5.4:1 on its tint
+_AMBER_TINT = "FDF3DC"
+
+# Calibri rather than Arial: it ships with every Office build on every platform
+# the workbook is opened on, including Excel mobile, so it renders as designed
+# instead of falling back. Arial is available too and simply looks its age.
+FONT = "Calibri"
+
+_HEADER_FILL = PatternFill("solid", fgColor=_BRAND)
+_HEADER_FONT = Font(name=FONT, size=9, bold=True, color="FFFFFF")
+_TITLE_FONT = Font(name=FONT, size=20, bold=True, color=_INK)
+_SECTION_FONT = Font(name=FONT, size=11, bold=True, color=_BRAND)
+_NOTE_FONT = Font(name=FONT, size=9, italic=True, color=_INK_SOFT)
+_SUBTITLE_FONT = Font(name=FONT, size=10, color=_INK_SOFT)
+_BODY_FONT = Font(name=FONT, size=10.5, color=_INK)
+_BOLD = Font(name=FONT, size=10.5, bold=True, color=_INK)
+_INPUT_FONT = Font(name=FONT, size=10.5, bold=True, color=_AMBER)
+_ASSUMPTION_FILL = PatternFill("solid", fgColor=_AMBER_TINT)
+_BAND_FILL = PatternFill("solid", fgColor=_SURFACE_BAND)
+_BORDER = Border(bottom=Side(style="thin", color=_RULE))
+_ACCENT_RULE = Border(bottom=Side(style="medium", color=_BRAND))
+
+# Ordered tiers, darkest = strongest. Read as text, so all three clear 4.5:1.
+_TIER_COLORS = {
+    "BIG": _BRAND, "MODERATE": _BRAND_MID, "SLIGHT": _BRAND_LIGHT,
+    "NONE": _INK_MUTED,
+    "HIGH": _BRAND, "MEDIUM": _BRAND_MID, "LEAN": _BRAND_LIGHT,
+    "COIN FLIP": _INK_MUTED,
+}
+
+# Which tabs are tables, and so get zebra striping. The Matchup Picker is a
+# form rather than a table and reads worse striped.
+_BANDED_SHEETS = {
+    "Predictions", "Spread", "Point Totals", "Player Projections",
+    "Betting Picks", "Power Ratings", "Last Week",
+}
+
+_TAB_COLORS = {
+    "Predictions": _BRAND, "Spread": _BRAND_MID, "Point Totals": _BRAND_MID,
+    "Player Projections": _BRAND_LIGHT, "Matchup Picker": _AMBER,
+    "Betting Picks": _BRAND, "Power Ratings": _BRAND_LIGHT,
+    "Last Week": _INK_MUTED,
+}
+
+_ROW_H_TITLE = 27.0
+_ROW_H_SUB = 15.0
+_ROW_H_GAP = 7.0
+_ROW_H_HEAD = 24.0
+_ROW_H_BODY = 19.0
 
 PCT = "0.0%"
 PCT2 = "0.00%"
@@ -209,21 +283,88 @@ def _inject_cached_values(path: Path, recorder: Recorder) -> int:
 
 
 def _write_header(sheet, row: int, headers: Sequence[str]) -> None:
+    """A solid header band, and a note of where the data starts.
+
+    Stashing the first data row on the sheet lets ``_polish`` stripe the table
+    afterwards without every builder having to hand its extent back.
+    """
     for index, label in enumerate(headers, start=1):
         cell = sheet.cell(row=row, column=index, value=label)
         cell.font = _HEADER_FONT
         cell.fill = _HEADER_FILL
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = _BORDER
+        cell.alignment = Alignment(
+            horizontal="left" if index <= 2 else "center",
+            vertical="center", wrap_text=True,
+        )
+    sheet.row_dimensions[row].height = _ROW_H_HEAD
+    sheet._nfl_data_start = row + 1
+
+
+def _band(sheet, first: int, last: int, columns: int) -> None:
+    """Stripe alternate rows, and set a comfortable row height on all of them.
+
+    Banding does the work borders used to. A rule under every row draws a grid
+    the reader has to look past; a stripe every other row guides the eye along
+    one game without adding a single line.
+    """
+    for row in range(first, last + 1):
+        sheet.row_dimensions[row].height = _ROW_H_BODY
+        if not (row - first) % 2:
+            continue
+        for col in range(1, columns + 1):
+            cell = sheet.cell(row=row, column=col)
+            # Never paint over a fill a builder already chose. The editable
+            # amber cells and the WON/LOST tints carry meaning; the stripe is
+            # only rhythm, and it loses. Striping first and meaning second put
+            # the input cells on a checkerboard.
+            if cell.fill is not None and cell.fill.patternType:
+                continue
+            cell.fill = _BAND_FILL
+
+
+def _polish(sheet, *, band: bool = False) -> None:
+    """The finishing pass every sheet gets: no gridlines, striped if tabular.
+
+    Turning gridlines off is the single largest change here. Excel's default
+    grid makes every sheet look like a worksheet; without it the type and the
+    header band carry the structure, which is what the eye wants anyway.
+    """
+    sheet.sheet_view.showGridLines = False
+    if sheet.title in _TAB_COLORS:
+        sheet.sheet_properties.tabColor = _TAB_COLORS[sheet.title]
+    if not band:
+        return
+
+    first = getattr(sheet, "_nfl_data_start", None)
+    if first is None:
+        return
+    # Walk to the end of the table proper. The notes at the foot are italic and
+    # the body is not, which is what separates them from a last data row.
+    last = first - 1
+    columns = 1
+    for row in range(first, sheet.max_row + 1):
+        cell = sheet.cell(row=row, column=1)
+        if cell.value is None or cell.font.italic:
+            break
+        last = row
+        filled = [c for c in range(1, sheet.max_column + 1)
+                  if sheet.cell(row=row, column=c).value is not None]
+        columns = max(columns, max(filled) if filled else 1)
+    if last >= first:
+        _band(sheet, first, last, columns)
 
 
 def _write_title(sheet, title: str, subtitle: str | None = None) -> int:
     sheet["A1"] = title
     sheet["A1"].font = _TITLE_FONT
+    sheet.row_dimensions[1].height = _ROW_H_TITLE
     if subtitle:
         sheet["A2"] = subtitle
-        sheet["A2"].font = _NOTE_FONT
+        sheet["A2"].font = _SUBTITLE_FONT
+        sheet.row_dimensions[2].height = _ROW_H_SUB
+        sheet.row_dimensions[3].height = _ROW_H_GAP
         return 4
+    sheet.row_dimensions[2].height = _ROW_H_GAP
     return 3
 
 
@@ -242,6 +383,57 @@ def _value(sheet, row: int, col: int, value, fmt: str | None = None, font=_BODY_
     if fmt:
         cell.number_format = fmt
     return cell
+
+
+def _paint_tier(cell, label) -> None:
+    """Colour an ordered tier label on its own ramp step.
+
+    The word stays in the cell. The colour says the same thing again, more
+    quietly, so a reader skimming the column sees the shape of the week before
+    reading any of it.
+    """
+    colour = _TIER_COLORS.get(str(label).strip().upper())
+    if colour:
+        cell.font = Font(name=FONT, size=10.5, bold=True, color=colour)
+
+
+def _tier_rules(sheet, cell_range: str) -> None:
+    """Colour a tier column that is computed by a formula.
+
+    A static font would be a lie the moment anything recalculates: the label
+    would change and the colour would not follow it. Conditional formatting
+    binds the two together, so a tier that moves takes its colour with it.
+    """
+    for label, colour in (
+        ("HIGH", _BRAND), ("MEDIUM", _BRAND_MID), ("LEAN", _BRAND_LIGHT),
+        ("COIN FLIP", _INK_MUTED),
+    ):
+        sheet.conditional_formatting.add(
+            cell_range,
+            CellIsRule(
+                operator="equal", formula=[f'"{label}"'],
+                font=Font(name=FONT, size=10.5, bold=True, color=colour),
+            ),
+        )
+
+
+def _pill(cell, outcome) -> None:
+    """Tint a settled result. The text already says which it was.
+
+    Red and green cannot be told apart by every reader, so they never carry the
+    answer here: the cell reads WON or LOST in words and the tint is only
+    reinforcement.
+    """
+    text = str(outcome).strip().upper()
+    if text.startswith("WON") or text.endswith("WON"):
+        ink, fill = _GOOD, _GOOD_TINT
+    elif text.startswith("LOST") or text.endswith("LOST"):
+        ink, fill = _BAD, _BAD_TINT
+    else:
+        return
+    cell.font = Font(name=FONT, size=10.5, bold=True, color=ink)
+    cell.fill = PatternFill("solid", fgColor=fill)
+    cell.alignment = Alignment(horizontal="center", vertical="center")
 
 
 def _rng(col: str, last_row: int) -> str:
@@ -1651,7 +1843,10 @@ def _simple_title(sheet, title: str, meta: dict, scorecard) -> int:
         )
     parts.append(f"rebuilt {meta['generated']}")
     sheet["A2"] = "  ·  ".join(parts)
-    sheet["A2"].font = _NOTE_FONT
+    sheet["A2"].font = _SUBTITLE_FONT
+    sheet.row_dimensions[1].height = _ROW_H_TITLE
+    sheet.row_dimensions[2].height = _ROW_H_SUB
+    sheet.row_dimensions[3].height = _ROW_H_GAP
     return 4
 
 
@@ -1706,6 +1901,7 @@ def _build_simple_predictions(sheet, rec: Recorder, slate, meta, scorecard) -> N
         _value(sheet, r, 9, outcome)
 
     last = first + len(slate)
+    _tier_rules(sheet, f"E{first}:E{last - 1}")
     _note(sheet, last + 1,
           "Right about two games in three (66.6% over 4,912 backtested games) -- "
           "level with the betting line, not better than it. Fair odds are what "
@@ -1907,13 +2103,19 @@ def _build_simple_last_week(sheet, scorecard, meta) -> None:
             "" if away_score is None else f"{away_score:.0f}-{home_score:.0f}",
         )
         _value(sheet, r, 4, str(getattr(game, "pick", "")), font=_BOLD)
-        _value(sheet, r, 5, _graded(getattr(game, "hit", None), half="PUSH"))
+        hit = _graded(getattr(game, "hit", None), half="PUSH")
+        _pill(_value(sheet, r, 5, hit), hit)
         _value(sheet, r, 6, _num(getattr(game, "market_spread", None)), SPREAD)
-        _value(sheet, r, 7, _graded(getattr(game, "ats_win", None)))
+        ats = _graded(getattr(game, "ats_win", None))
+        _pill(_value(sheet, r, 7, ats), ats)
         _value(sheet, r, 8, _num(getattr(game, "market_total", None)), "0.0")
         ou_pick = str(getattr(game, "ou_pick", "-"))
         ou = _graded(getattr(game, "ou_win", None))
-        _value(sheet, r, 9, "" if ou == "" else f"{ou_pick.title()} — {ou.lower()}")
+        _pill(
+            _value(sheet, r, 9,
+                   "" if ou == "" else f"{ou_pick.title()} — {ou.lower()}"),
+            ou,
+        )
 
     last = first + len(played)
     _note(sheet, last + 1,
@@ -2101,7 +2303,11 @@ def _build_simple_picks(sheet, rec: Recorder, slate, meta, scorecard) -> None:
     ):
         for entry in group:
             _, matchup, pick, model, line, edge, conf, rating, realised, ev = entry
-            _value(sheet, r, 1, label)
+            # The market repeats down a block of sixteen. Muting it lets the
+            # eye land on the game and the pick instead of reading "Moneyline"
+            # sixteen times on the way there.
+            _value(sheet, r, 1, label).font = Font(
+                name=FONT, size=10.5, color=_INK_MUTED)
             _value(sheet, r, 2, matchup)
             _value(sheet, r, 3, pick, font=_BOLD)
             if model is not None:
@@ -2109,8 +2315,8 @@ def _build_simple_picks(sheet, rec: Recorder, slate, meta, scorecard) -> None:
                 _value(sheet, r, 5, line, fmt)
                 _value(sheet, r, 6, edge, SPREAD)
             _value(sheet, r, 7, conf, PCT)
-            _value(sheet, r, 8, rating)
-            _value(sheet, r, 9, realised)
+            _paint_tier(_value(sheet, r, 8, rating), rating)
+            _value(sheet, r, 9, realised).font = _NOTE_FONT
             _value(sheet, r, 10, ev, "+0.000;-0.000")
             r += 1
 
@@ -2314,6 +2520,9 @@ def export_simple_workbook(
     _build_simple_ratings(sheets["Power Ratings"], ratings, meta, scorecard)
     _build_simple_last_week(sheets["Last Week"], scorecard, meta)
 
+    for name, sheet in sheets.items():
+        _polish(sheet, band=name in _BANDED_SHEETS)
+
     workbook.active = 0
     workbook.save(path)
     _inject_cached_values(path, rec)
@@ -2380,6 +2589,11 @@ def export_workbook(
     for name, sheet in sheets.items():
         if name != "Start Here":
             _add_back_link(sheet)
+        # The long workbook is every tab the short one has plus the backtest
+        # pages, and they are all tables, so they all stripe. Game Log is the
+        # exception: it is thousands of rows of raw input meant to be filtered
+        # rather than read, and striping it is both slow to write and no help.
+        _polish(sheet, band=name not in ("Start Here", "Game Log", "Matchup Picker"))
     workbook.active = workbook.index(sheets["Start Here"])
 
     workbook.save(path)

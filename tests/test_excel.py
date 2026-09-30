@@ -582,6 +582,65 @@ def test_every_game_gets_a_pick_in_all_three_markets(simple_workbook, workbook_i
         assert len([r for r in rows if r["market"] == market]) == len(slate)
 
 
+def test_banding_never_paints_over_a_meaningful_fill(simple_workbook):
+    """The stripe is rhythm; the amber and the WON/LOST tints are meaning.
+
+    Banding runs after the builders, so a naive stripe overwrites every fill
+    they set on alternate rows. It did: the editable column came out a
+    checkerboard, half amber and half stripe, which reads as though only some
+    rows are yours to fill in.
+    """
+    wb = load_workbook(simple_workbook)
+
+    editable = [
+        wb["Predictions"].cell(r, 8)
+        for r in range(5, 5 + 16)
+    ]
+    fills = {c.fill.fgColor.rgb for c in editable if c.fill.patternType}
+    assert fills == {"00FDF3DC"}, f"editable column is striped: {fills}"
+
+
+def test_banding_preserves_a_status_tint():
+    """The same rule, on the tint a settled result carries.
+
+    The fixture slate is a season opener, so its Last Week tab is empty and
+    cannot exercise this. Driving the two helpers directly is the honest way
+    to pin the interaction that actually broke: the stripe runs last, so it is
+    the one that has to yield.
+    """
+    from openpyxl import Workbook
+    from nflpredict.excel import _band, _pill
+
+    sheet = Workbook().active
+    for offset, outcome in enumerate(("WON", "LOST", "WON", "LOST")):
+        _pill(sheet.cell(row=2 + offset, column=1, value=outcome), outcome)
+        sheet.cell(row=2 + offset, column=2, value="plain")
+    _band(sheet, 2, 5, 2)
+
+    for offset, outcome in enumerate(("WON", "LOST", "WON", "LOST")):
+        cell = sheet.cell(row=2 + offset, column=1)
+        expected = "00E6F6E6" if outcome == "WON" else "00FBEAEA"
+        assert cell.fill.fgColor.rgb == expected, f"row {2 + offset} lost its tint"
+
+    # The column beside it had no fill of its own, so it stripes normally.
+    assert sheet.cell(row=3, column=2).fill.fgColor.rgb == "00F5F8FD"
+    assert not sheet.cell(row=2, column=2).fill.patternType
+
+
+def test_every_sheet_hides_the_gridlines(simple_workbook):
+    """The single largest change: without the grid the type carries structure."""
+    wb = load_workbook(simple_workbook)
+    for name in wb.sheetnames:
+        assert wb[name].sheet_view.showGridLines is False, name
+
+
+def test_the_confidence_column_is_coloured_by_rule_not_by_font(simple_workbook):
+    """It is a formula, so a static font would go stale the moment it recalcs."""
+    sheet = load_workbook(simple_workbook)["Predictions"]
+    ranges = [str(cf.sqref) for cf in sheet.conditional_formatting]
+    assert any(r.startswith("E") for r in ranges), ranges
+
+
 def test_picks_are_ranked_within_each_market(simple_workbook):
     """Ranked inside its own market, not across all three.
 
